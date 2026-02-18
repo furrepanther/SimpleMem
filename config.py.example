@@ -64,6 +64,21 @@ OVERLAP_SIZE = 2
 
 
 # ============================================================================
+# Online Semantic Synthesis (Section 3.2)
+# ============================================================================
+
+# Enable synthesis to merge similar entries during memory building
+# When False (default), the write path is identical to the original pipeline
+ENABLE_SYNTHESIS = False
+
+# Cosine similarity threshold above which two entries are considered mergeable
+SYNTHESIS_SIMILARITY_THRESHOLD = 0.85
+
+# Maximum candidate entries to retrieve when checking for duplicates
+SYNTHESIS_MAX_CANDIDATES = 10
+
+
+# ============================================================================
 # Retrieval Parameters (can be adjusted to balance between token usage and performance)
 # ============================================================================
 

@@ -107,6 +107,61 @@ def test_get_all_entries(store):
     return True
 
 
+def test_find_similar_entries(store):
+    """Encode known text, search, verify results have correct structure and meet threshold."""
+    print("\n[TEST] Find similar entries...")
+    query_vector = store.embedding_model.encode_single(
+        "meeting at Starbucks", is_query=True
+    ).tolist()
+    results = store.find_similar_entries(query_vector, top_k=5, similarity_threshold=0.5)
+    assert len(results) > 0, "Should find at least one similar entry"
+    for r in results:
+        assert "entry" in r, "Result should have 'entry' key"
+        assert "vector" in r, "Result should have 'vector' key"
+        assert "cosine_similarity" in r, "Result should have 'cosine_similarity' key"
+        assert isinstance(r["entry"], MemoryEntry), "entry should be a MemoryEntry"
+        assert r["cosine_similarity"] >= 0.5, f"Similarity {r['cosine_similarity']} below threshold"
+    print(f"  PASS: Found {len(results)} similar entries with correct structure")
+    return True
+
+
+def test_find_similar_entries_threshold(store):
+    """Verify high threshold filters out lower-similarity results."""
+    print("\n[TEST] Find similar entries with high threshold...")
+    query_vector = store.embedding_model.encode_single(
+        "completely unrelated quantum physics topic", is_query=True
+    ).tolist()
+    results = store.find_similar_entries(query_vector, top_k=5, similarity_threshold=0.99)
+    # With a 0.99 threshold, unlikely to find matches for unrelated query
+    print(f"  Results at 0.99 threshold: {len(results)} (expected 0 or very few)")
+    # This is a soft check — the important thing is the threshold filtering works
+    for r in results:
+        assert r["cosine_similarity"] >= 0.99, f"Entry below threshold: {r['cosine_similarity']}"
+    print(f"  PASS: Threshold filtering works correctly")
+    return True
+
+
+def test_delete_entry(store):
+    """Delete by ID, verify entry count decreases and ID is gone."""
+    print("\n[TEST] Delete entry...")
+    entries_before = store.get_all_entries()
+    count_before = len(entries_before)
+    assert count_before > 0, "Need at least one entry to test deletion"
+
+    target_id = entries_before[0].entry_id
+    store.delete_entry(target_id)
+
+    entries_after = store.get_all_entries()
+    count_after = len(entries_after)
+    assert count_after == count_before - 1, (
+        f"Expected {count_before - 1} entries after deletion, got {count_after}"
+    )
+    remaining_ids = [e.entry_id for e in entries_after]
+    assert target_id not in remaining_ids, f"Deleted entry {target_id} still present"
+    print(f"  PASS: Deleted entry, count {count_before} -> {count_after}")
+    return True
+
+
 def test_gcs_connection(bucket_path, service_account_path=None):
     """
     Test GCS backend with native FTS.
@@ -212,7 +267,10 @@ def main():
         test_structured_search_location,
         test_structured_search_timestamp,
         test_optimize,
+        test_find_similar_entries,
+        test_find_similar_entries_threshold,
         test_get_all_entries,
+        test_delete_entry,  # Run last since it modifies data
     ]
 
     passed = 0
