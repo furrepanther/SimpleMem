@@ -7,6 +7,7 @@ Implements three-layer indexing I(m_k):
 - Symbolic Layer: r_k = E_sym(m_k) - Metadata filtering (SQL)
 """
 from typing import List, Optional, Dict, Any
+import math
 import lancedb
 import pyarrow as pa
 from models.memory_entry import MemoryEntry
@@ -231,6 +232,62 @@ class VectorStore:
         except Exception as e:
             print(f"Error during structured search: {e}")
             return []
+
+    def find_similar_entries(
+        self,
+        query_vector: List[float],
+        top_k: int = 10,
+        similarity_threshold: float = 0.85
+    ) -> List[Dict[str, Any]]:
+        """
+        Find entries similar to the given vector above a cosine similarity threshold.
+
+        Returns list of dicts with keys: 'entry', 'vector', 'cosine_similarity'.
+        Computes exact cosine similarity from raw vectors to avoid LanceDB
+        distance metric ambiguity.
+        """
+        try:
+            if self.table.count_rows() == 0:
+                return []
+
+            results = self.table.search(query_vector).limit(top_k).to_list()
+
+            similar = []
+            for r in results:
+                vec = list(r.get("vector") or [])
+                if not vec:
+                    continue
+                sim = self._cosine_similarity(query_vector, vec)
+                if sim >= similarity_threshold:
+                    entry = self._results_to_entries([r])
+                    if entry:
+                        similar.append({
+                            "entry": entry[0],
+                            "vector": vec,
+                            "cosine_similarity": sim,
+                        })
+            return similar
+        except Exception as e:
+            print(f"Error during find_similar_entries: {e}")
+            return []
+
+    def delete_entry(self, entry_id: str):
+        """Delete a single entry by its entry_id."""
+        try:
+            safe_id = entry_id.replace("'", "''")
+            self.table.delete(f"entry_id = '{safe_id}'")
+        except Exception as e:
+            print(f"Error deleting entry {entry_id}: {e}")
+
+    @staticmethod
+    def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+        """Compute cosine similarity between two vectors."""
+        dot = sum(a * b for a, b in zip(vec_a, vec_b))
+        mag_a = math.sqrt(sum(a * a for a in vec_a))
+        mag_b = math.sqrt(sum(b * b for b in vec_b))
+        if mag_a == 0.0 or mag_b == 0.0:
+            return 0.0
+        return dot / (mag_a * mag_b)
 
     def get_all_entries(self) -> List[MemoryEntry]:
         """Get all memory entries."""

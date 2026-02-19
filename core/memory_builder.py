@@ -7,15 +7,15 @@ Implements:
 - Sliding window processing for dialogue segmentation
 - Generates compact memory units with resolved coreferences and absolute timestamps
 """
+import concurrent.futures
+import json
 from typing import List, Optional
+
+import config
+from core.synthesis import SemanticSynthesizer
+from database.vector_store import VectorStore
 from models.memory_entry import MemoryEntry, Dialogue
 from utils.llm_client import LLMClient
-from database.vector_store import VectorStore
-import config
-import json
-import asyncio
-import concurrent.futures
-from functools import partial
 
 
 class MemoryBuilder:
@@ -33,13 +33,23 @@ class MemoryBuilder:
         llm_client: LLMClient,
         vector_store: VectorStore,
         window_size: int = None,
+        overlap_size: int = None,
         enable_parallel_processing: bool = True,
         max_parallel_workers: int = 3
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
         self.window_size = window_size or config.WINDOW_SIZE
-        
+        self.overlap_size = overlap_size if overlap_size is not None else getattr(config, 'OVERLAP_SIZE', 0)
+
+        # Validate overlap_size
+        if self.overlap_size < 0:
+            raise ValueError(f"overlap_size must be non-negative, got {self.overlap_size}")
+        if self.overlap_size >= self.window_size:
+            raise ValueError(
+                f"overlap_size ({self.overlap_size}) must be less than window_size ({self.window_size})"
+            )
+
         # Use config values as default if not explicitly provided
         self.enable_parallel_processing = enable_parallel_processing if enable_parallel_processing is not None else getattr(config, 'ENABLE_PARALLEL_PROCESSING', True)
         self.max_parallel_workers = max_parallel_workers if max_parallel_workers is not None else getattr(config, 'MAX_PARALLEL_WORKERS', 4)
@@ -50,6 +60,14 @@ class MemoryBuilder:
 
         # Previous window entries (for context)
         self.previous_entries: List[MemoryEntry] = []
+
+        # Optional Stage 2: Online Semantic Synthesis
+        self.synthesizer: Optional[SemanticSynthesizer] = None
+        if getattr(config, 'ENABLE_SYNTHESIS', False):
+            self.synthesizer = SemanticSynthesizer(
+                llm_client=self.llm_client,
+                vector_store=self.vector_store,
+            )
 
     def add_dialogue(self, dialogue: Dialogue, auto_process: bool = True):
         """
@@ -88,9 +106,10 @@ class MemoryBuilder:
             
             # Group into windows for parallel processing (including remaining dialogues)
             windows_to_process = []
+            advance = self.window_size - self.overlap_size
             while len(self.dialogue_buffer) >= self.window_size:
                 window = self.dialogue_buffer[:self.window_size]
-                self.dialogue_buffer = self.dialogue_buffer[self.window_size:]
+                self.dialogue_buffer = self.dialogue_buffer[advance:]
                 windows_to_process.append(window)
             
             # Add remaining dialogues as a smaller batch (no need to process separately)
@@ -119,14 +138,22 @@ class MemoryBuilder:
         if not self.dialogue_buffer:
             return
 
-        # Extract window
+        # Extract window, retaining overlap for context continuity
         window = self.dialogue_buffer[:self.window_size]
-        self.dialogue_buffer = self.dialogue_buffer[self.window_size:]
+        advance = self.window_size - self.overlap_size
+        self.dialogue_buffer = self.dialogue_buffer[advance:]
 
         print(f"\nProcessing window: {len(window)} dialogues (processed {self.processed_count} so far)")
 
         # Call LLM to generate memory entries
         entries = self._generate_memory_entries(window)
+
+        # Stage 2: Online Semantic Synthesis (merge similar existing entries)
+        if entries and self.synthesizer:
+            syn_result = self.synthesizer.synthesize(entries)
+            for old_id in syn_result.entries_to_delete:
+                self.vector_store.delete_entry(old_id)
+            entries = syn_result.entries_to_store
 
         # Store to database
         if entries:
@@ -143,6 +170,14 @@ class MemoryBuilder:
         if self.dialogue_buffer:
             print(f"\nProcessing remaining dialogues: {len(self.dialogue_buffer)} (fallback mode)")
             entries = self._generate_memory_entries(self.dialogue_buffer)
+
+            # Stage 2: Online Semantic Synthesis
+            if entries and self.synthesizer:
+                syn_result = self.synthesizer.synthesize(entries)
+                for old_id in syn_result.entries_to_delete:
+                    self.vector_store.delete_entry(old_id)
+                entries = syn_result.entries_to_store
+
             if entries:
                 self.vector_store.add_entries(entries)
                 self.processed_count += len(self.dialogue_buffer)
@@ -342,6 +377,15 @@ Now process the above dialogues. Return ONLY the JSON array, no other explanatio
                 except Exception as e:
                     print(f"[Parallel Processing] Window {window_num} failed: {e}")
         
+        # Stage 2: Online Semantic Synthesis on combined results
+        if all_entries and self.synthesizer:
+            print(f"\n[Parallel Processing] Running synthesis on {len(all_entries)} entries...")
+            syn_result = self.synthesizer.synthesize(all_entries)
+            for old_id in syn_result.entries_to_delete:
+                self.vector_store.delete_entry(old_id)
+            all_entries = syn_result.entries_to_store
+            print(f"[Parallel Processing] Synthesis: {syn_result.merged_count} merged, {syn_result.passthrough_count} passed through")
+
         # Store all entries to database in batch
         if all_entries:
             print(f"\n[Parallel Processing] Storing {len(all_entries)} entries to database...")

@@ -32,6 +32,8 @@ class SimpleMemSystem:
         clear_db: bool = False,
         enable_thinking: Optional[bool] = None,
         use_streaming: Optional[bool] = None,
+        window_size: Optional[int] = None,
+        overlap_size: Optional[int] = None,
         enable_planning: Optional[bool] = None,
         enable_reflection: Optional[bool] = None,
         max_reflection_rounds: Optional[int] = None,
@@ -52,6 +54,8 @@ class SimpleMemSystem:
         - clear_db: Whether to clear existing database
         - enable_thinking: Enable deep thinking mode (for Qwen and compatible models)
         - use_streaming: Enable streaming responses
+        - window_size: Number of dialogues per processing window (None=use config default)
+        - overlap_size: Number of dialogues to retain between windows for context continuity (None=use config default)
         - enable_planning: Enable multi-query planning for retrieval (None=use config default)
         - enable_reflection: Enable reflection-based additional retrieval (None=use config default)
         - max_reflection_rounds: Maximum number of reflection rounds (None=use config default)
@@ -87,6 +91,8 @@ class SimpleMemSystem:
         self.memory_builder = MemoryBuilder(
             llm_client=self.llm_client,
             vector_store=self.vector_store,
+            window_size=window_size,
+            overlap_size=overlap_size,
             enable_parallel_processing=enable_parallel_processing,
             max_parallel_workers=max_parallel_workers
         )
@@ -205,6 +211,8 @@ class SimpleMemSystem:
 # Convenience function
 def create_system(
     clear_db: bool = False,
+    window_size: Optional[int] = None,
+    overlap_size: Optional[int] = None,
     enable_planning: Optional[bool] = None,
     enable_reflection: Optional[bool] = None,
     max_reflection_rounds: Optional[int] = None,
@@ -218,6 +226,8 @@ def create_system(
     """
     return SimpleMemSystem(
         clear_db=clear_db,
+        window_size=window_size,
+        overlap_size=overlap_size,
         enable_planning=enable_planning,
         enable_reflection=enable_reflection,
         max_reflection_rounds=max_reflection_rounds,
