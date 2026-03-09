@@ -108,7 +108,7 @@
 
 <br/>
 
-[Overview](#-overview) • [Quick Start](#-quick-start) • [Cross-Session Memory](#-cross-session-memory) • [MCP Server](#-mcp-server) • [Evaluation](#-evaluation) • [Citation](#-citation)
+[Overview](#-overview) • [Quick Start](#-quick-start) • [Docker](#-run-with-docker) • [Cross-Session Memory](#-cross-session-memory) • [MCP Server](#-mcp-server) • [Evaluation](#-evaluation) • [Citation](#-citation)
 
 </div>
 
@@ -134,6 +134,7 @@
 - [🎯 Key Contributions](#-key-contributions)
 - [🚀 Performance Highlights](#-performance-highlights)
 - [📦 Installation](#-installation)
+- [🐳 Run with Docker](#-run-with-docker)
 - [⚡ Quick Start](#-quick-start)
 - [🧠 Cross-Session Memory](#-cross-session-memory)
 - [🔌 MCP Server](#-mcp-server)
@@ -374,6 +375,61 @@ EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"  # State-of-the-art retrieval
 
 ---
 
+## 🐳 Run with Docker
+
+The **MCP Server** can be run in Docker for a consistent, isolated environment. Data (LanceDB and user DB) is persisted in a host volume.
+
+### Prerequisites
+
+- [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/)
+
+### Quick run
+
+```bash
+# From the repository root
+docker compose up -d
+```
+
+- **Web UI:** http://localhost:8000/
+- **REST API:** http://localhost:8000/api/
+- **MCP (SSE):** http://localhost:8000/mcp/sse?token=&lt;TOKEN&gt;
+
+Data is stored in `./data` on the host (created automatically).
+
+### Custom configuration
+
+1. Copy the environment template and edit it:
+   ```bash
+   cp .env.example .env
+   # Edit .env: set JWT_SECRET_KEY, ENCRYPTION_KEY, LLM_PROVIDER, model URLs, etc.
+   ```
+2. Run with the env file:
+   ```bash
+   docker compose --env-file .env up -d
+   ```
+
+### Using Ollama on the host
+
+When `LLM_PROVIDER=ollama` and Ollama runs on your machine (not in Docker), set in `.env`:
+
+```bash
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
+```
+
+On Linux, `host.docker.internal` is enabled automatically via the Compose file.
+
+### Useful commands
+
+```bash
+docker compose logs -f simplemem   # Follow logs
+docker compose down                 # Stop and remove containers
+```
+
+> 📖 For self-hosting the MCP server (Docker or bare metal), see [MCP Documentation](MCP/README.md).
+
+---
+
 ## ⚡ Quick Start
 
 ### 🧠 Understanding the Basic Workflow
@@ -539,7 +595,7 @@ Session Manager  Context Injector  Consolidation
 
 SimpleMem is available as a **cloud-hosted memory service** via the Model Context Protocol (MCP), enabling seamless integration with AI assistants like Claude Desktop, Cursor, and other MCP-compatible clients.
 
-**🌐 Cloud Service**: [mcp.simplemem.cloud](https://mcp.simplemem.cloud)
+**🌐 Cloud Service**: [mcp.simplemem.cloud](https://mcp.simplemem.cloud) — or self-host the MCP server locally using [Docker](#-run-with-docker).
 
 ### Key Features
 

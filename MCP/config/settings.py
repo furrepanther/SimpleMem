@@ -118,9 +118,19 @@ class Settings:
     use_streaming: bool = True
 
     def __post_init__(self):
-        """Ensure directories exist"""
-        os.makedirs(self.data_dir, exist_ok=True)
-        os.makedirs(self.lancedb_path, exist_ok=True)
+        """Ensure directories exist; use absolute paths so cwd and permissions are predictable."""
+        data_dir = os.path.abspath(os.path.expanduser(self.data_dir))
+        lancedb_path = os.path.abspath(os.path.expanduser(self.lancedb_path))
+        self.data_dir = data_dir
+        self.lancedb_path = lancedb_path
+        try:
+            os.makedirs(self.data_dir, exist_ok=True)
+            os.makedirs(self.lancedb_path, exist_ok=True)
+        except PermissionError as e:
+            raise PermissionError(
+                f"Cannot create data dir(s): {e}. "
+                "In Docker, use a named volume for data (see docker-compose.yml) or ensure the mounted dir is writable by the container user."
+            ) from e
 
 
 @lru_cache()
