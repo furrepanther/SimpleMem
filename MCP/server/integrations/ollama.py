@@ -16,34 +16,53 @@ class OllamaClient:
     def __init__(
         self,
         base_url: str = "http://localhost:11434/v1",
+        embedding_base_url: Optional[str] = None,
         llm_model: str = "qwen2.5:7b",
         embedding_model: str = "nomic-embed-text",
     ):
         self.base_url = base_url.rstrip("/")
+        self.embedding_base_url = (embedding_base_url or base_url).rstrip("/")
         self.llm_model = llm_model
         self.embedding_model = embedding_model
 
         # Lazy import to avoid issues if not installed
-        self._client = None
+        self._chat_client = None
+        self._embed_client = None
 
-    def _get_client(self):
-        """Get or create the HTTP client"""
-        if self._client is None:
+    def _get_chat_client(self):
+        """Get or create chat client."""
+        if self._chat_client is None:
             import httpx
-            self._client = httpx.AsyncClient(
+            self._chat_client = httpx.AsyncClient(
                 base_url=self.base_url,
                 headers={
                     "Content-Type": "application/json",
                 },
                 timeout=120.0,
             )
-        return self._client
+        return self._chat_client
+
+    def _get_embed_client(self):
+        """Get or create embedding client."""
+        if self._embed_client is None:
+            import httpx
+            self._embed_client = httpx.AsyncClient(
+                base_url=self.embedding_base_url,
+                headers={
+                    "Content-Type": "application/json",
+                },
+                timeout=120.0,
+            )
+        return self._embed_client
 
     async def close(self):
-        """Close the HTTP client"""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        """Close underlying clients."""
+        if self._chat_client:
+            await self._chat_client.aclose()
+            self._chat_client = None
+        if self._embed_client:
+            await self._embed_client.aclose()
+            self._embed_client = None
 
     async def chat_completion(
         self,
@@ -66,7 +85,7 @@ class OllamaClient:
         Returns:
             Generated text content
         """
-        client = self._get_client()
+        client = self._get_chat_client()
 
         payload = {
             "model": self.llm_model,
@@ -93,7 +112,7 @@ class OllamaClient:
 
     async def _stream_completion(self, payload: Dict) -> str:
         """Stream chat completion and return full content"""
-        client = self._get_client()
+        client = self._get_chat_client()
         payload["stream"] = True
 
         content_parts = []
@@ -128,7 +147,7 @@ class OllamaClient:
         Returns:
             List of embedding vectors
         """
-        client = self._get_client()
+        client = self._get_embed_client()
 
         # Ollama uses /embeddings endpoint for single text
         # For multiple texts, we need to call it multiple times
@@ -161,7 +180,7 @@ class OllamaClient:
             Tuple of (is_valid, error_message)
         """
         try:
-            client = self._get_client()
+            client = self._get_chat_client()
             # Try to list models to verify connectivity
             response = await client.get("/models")
             if response.status_code == 200:
@@ -306,10 +325,12 @@ class OllamaClientManager:
     def __init__(
         self,
         base_url: str = "http://localhost:11434/v1",
+        embedding_base_url: Optional[str] = None,
         llm_model: str = "qwen2.5:7b",
         embedding_model: str = "nomic-embed-text",
     ):
         self.base_url = base_url
+        self.embedding_base_url = embedding_base_url or base_url
         self.llm_model = llm_model
         self.embedding_model = embedding_model
         self._client: Optional[OllamaClient] = None
@@ -327,6 +348,7 @@ class OllamaClientManager:
         if self._client is None:
             self._client = OllamaClient(
                 base_url=self.base_url,
+                embedding_base_url=self.embedding_base_url,
                 llm_model=self.llm_model,
                 embedding_model=self.embedding_model,
             )

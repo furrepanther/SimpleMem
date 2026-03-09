@@ -72,11 +72,19 @@ class Settings:
         "OPENROUTER_BASE_URL",
         "https://openrouter.ai/api/v1"
     ))
+    openrouter_embedding_base_url: str = field(default_factory=lambda: os.getenv(
+        "OPENROUTER_EMBED_BASE_URL",
+        os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    ))
 
     # Ollama Configuration (used when llm_provider is "ollama")
     ollama_base_url: str = field(default_factory=lambda: os.getenv(
         "OLLAMA_BASE_URL",
         "http://localhost:11434/v1"
+    ))
+    ollama_embedding_base_url: str = field(default_factory=lambda: os.getenv(
+        "OLLAMA_EMBED_BASE_URL",
+        os.getenv("OLLAMA_EMBEDDING_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"))
     ))
 
     # Common LLM Configuration

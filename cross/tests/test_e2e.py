@@ -445,7 +445,7 @@ class TestEndToEnd:
         memory_session_id = "redact-test-001"
 
         # Record a message containing a sensitive API key
-        api_key = "sk-abc123xyz456789012345678901234567890"
+        api_key = "your-test-api-key-placeholder"
         content_with_key = f"Use this API key: {api_key} for authentication"
 
         event = collector.record_message(

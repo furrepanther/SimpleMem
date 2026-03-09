@@ -4,6 +4,7 @@ OpenRouter SDK integration for LLM and Embedding services
 
 import json
 import re
+from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional, AsyncGenerator
 
 
@@ -17,38 +18,67 @@ class OpenRouterClient:
         self,
         api_key: str,
         base_url: str = "https://openrouter.ai/api/v1",
+        embedding_base_url: Optional[str] = None,
         llm_model: str = "openai/gpt-4.1-mini",
         embedding_model: str = "qwen/qwen3-embedding-4b",
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.embedding_base_url = (embedding_base_url or base_url).rstrip("/")
         self.llm_model = llm_model
         self.embedding_model = embedding_model
 
         # Lazy import to avoid issues if not installed
-        self._client = None
+        self._chat_client = None
+        self._embed_client = None
 
-    def _get_client(self):
-        """Get or create the HTTP client"""
-        if self._client is None:
+    @staticmethod
+    def _is_local_base_url(base_url: str) -> bool:
+        host = (urlparse(base_url or "").hostname or "").lower()
+        return host in {"127.0.0.1", "localhost", "::1"}
+
+    def _build_headers(self) -> Dict[str, str]:
+        headers: Dict[str, str] = {
+            "Content-Type": "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        # OpenRouter-specific headers are not required for local gateways.
+        if not self._is_local_base_url(self.base_url):
+            headers["HTTP-Referer"] = "https://simplemem.app"
+            headers["X-Title"] = "SimpleMem MCP Server"
+        return headers
+
+    def _get_chat_client(self):
+        """Get or create the chat HTTP client."""
+        if self._chat_client is None:
             import httpx
-            self._client = httpx.AsyncClient(
+            self._chat_client = httpx.AsyncClient(
                 base_url=self.base_url,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://simplemem.app",
-                    "X-Title": "SimpleMem MCP Server",
-                },
+                headers=self._build_headers(),
                 timeout=120.0,
             )
-        return self._client
+        return self._chat_client
+
+    def _get_embed_client(self):
+        """Get or create the embedding HTTP client."""
+        if self._embed_client is None:
+            import httpx
+            self._embed_client = httpx.AsyncClient(
+                base_url=self.embedding_base_url,
+                headers=self._build_headers(),
+                timeout=120.0,
+            )
+        return self._embed_client
 
     async def close(self):
         """Close the HTTP client"""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        if self._chat_client:
+            await self._chat_client.aclose()
+            self._chat_client = None
+        if self._embed_client:
+            await self._embed_client.aclose()
+            self._embed_client = None
 
     async def chat_completion(
         self,
@@ -71,7 +101,7 @@ class OpenRouterClient:
         Returns:
             Generated text content
         """
-        client = self._get_client()
+        client = self._get_chat_client()
 
         payload = {
             "model": self.llm_model,
@@ -96,7 +126,7 @@ class OpenRouterClient:
 
     async def _stream_completion(self, payload: Dict) -> str:
         """Stream chat completion and return full content"""
-        client = self._get_client()
+        client = self._get_chat_client()
         payload["stream"] = True
 
         content_parts = []
@@ -131,7 +161,7 @@ class OpenRouterClient:
         Returns:
             List of embedding vectors
         """
-        client = self._get_client()
+        client = self._get_embed_client()
 
         payload = {
             "model": self.embedding_model,
@@ -158,12 +188,23 @@ class OpenRouterClient:
         Returns:
             Tuple of (is_valid, error_message)
         """
-        # Check key format first - OpenRouter keys start with sk-or-
+        if self._is_local_base_url(self.base_url):
+            # Local gateway mode: verify endpoint reachability, not remote key semantics.
+            try:
+                client = self._get_chat_client()
+                response = await client.get("/models")
+                if response.status_code == 200:
+                    return True, None
+                return False, f"Local gateway error: {response.status_code}"
+            except Exception as e:
+                return False, f"Connection error: {str(e)}"
+
+        # Cloud mode: enforce OpenRouter key semantics.
         if not self.api_key or not self.api_key.startswith("sk-or-"):
             return False, "Invalid key format. OpenRouter API keys start with 'sk-or-'. Get yours at openrouter.ai/keys"
 
         try:
-            client = self._get_client()
+            client = self._get_chat_client()
             # Use /auth/key endpoint to verify the key
             response = await client.get("/auth/key")
             if response.status_code == 200:
@@ -316,10 +357,12 @@ class OpenRouterClientManager:
     def __init__(
         self,
         base_url: str = "https://openrouter.ai/api/v1",
+        embedding_base_url: Optional[str] = None,
         llm_model: str = "openai/gpt-4.1-mini",
         embedding_model: str = "qwen/qwen3-embedding-4b",
     ):
         self.base_url = base_url
+        self.embedding_base_url = embedding_base_url or base_url
         self.llm_model = llm_model
         self.embedding_model = embedding_model
         self._clients: Dict[str, OpenRouterClient] = {}
@@ -342,6 +385,7 @@ class OpenRouterClientManager:
             self._clients[key_hash] = OpenRouterClient(
                 api_key=api_key,
                 base_url=self.base_url,
+                embedding_base_url=self.embedding_base_url,
                 llm_model=self.llm_model,
                 embedding_model=self.embedding_model,
             )

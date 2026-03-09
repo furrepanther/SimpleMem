@@ -106,12 +106,14 @@ token_manager = TokenManager(
 if settings.llm_provider == "ollama":
     client_manager = OllamaClientManager(
         base_url=settings.ollama_base_url,
+        embedding_base_url=settings.ollama_embedding_base_url,
         llm_model=settings.llm_model,
         embedding_model=settings.embedding_model,
     )
 else:  # Default to OpenRouter
     client_manager = OpenRouterClientManager(
         base_url=settings.openrouter_base_url,
+        embedding_base_url=settings.openrouter_embedding_base_url,
         llm_model=settings.llm_model,
         embedding_model=settings.embedding_model,
     )
@@ -295,8 +297,8 @@ async def register(request: RegisterRequest):
         # For Ollama, we don't need a real API key, use a placeholder
         if settings.llm_provider == "ollama":
             if not api_key or api_key == "":
-                # Use a placeholder key for Ollama
-                api_key = "ollama-placeholder-key"
+                # Local Ollama mode does not require a remote provider key.
+                api_key = os.getenv("OPENROUTER_API_KEY") or "local-mode"
 
             # Verify Ollama is accessible
             client = OllamaClient(base_url=settings.ollama_base_url)

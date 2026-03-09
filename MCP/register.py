@@ -4,6 +4,7 @@ Simple registration script to get API token for SimpleMem MCP
 """
 import requests
 import json
+import os
 
 API_BASE = "http://localhost:8000"
 
@@ -14,8 +15,8 @@ def register():
     print("=" * 60)
     print()
 
-    # For Ollama, we don't need a real API key
-    api_key = "ollama-placeholder-key"
+    # For local Ollama mode, accept env override and use non-secret local marker by default.
+    api_key = os.getenv("OPENROUTER_API_KEY") or "local-mode"
 
     print(f"Registering with API key: {api_key}")
     print()
