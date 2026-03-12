@@ -1,19 +1,26 @@
 """
-MCP Protocol Handler - JSON-RPC 2.0 over SSE
+MCP Protocol Handler - JSON-RPC 2.0 over SSE.
 
-Implements the Model Context Protocol for remote clients like Claude Desktop.
+Implements the Model Context Protocol for remote clients.
 """
 
-import json
+from __future__ import annotations
+
 import asyncio
-from typing import Any, Optional, AsyncGenerator
-from dataclasses import dataclass, asdict
+import hashlib
+import json
+import uuid
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Optional
 
 from .auth.models import User, MemoryEntry
-from .database.vector_store import MultiTenantVectorStore
+from .core.answer_generator import AnswerGenerator
 from .core.memory_builder import MemoryBuilder
 from .core.retriever import Retriever
-from .core.answer_generator import AnswerGenerator
+from .database.durable_job_store import DurableJobStore
+from .database.vector_store import MultiTenantVectorStore
 
 # Type alias for client manager (supports both OpenRouter and Ollama)
 ClientManager = object  # Duck-typed: can be OpenRouterClientManager or OllamaClientManager
@@ -43,16 +50,36 @@ class JsonRpcResponse:
         return d
 
 
-# MCP Protocol Constants
-MCP_VERSION = "2025-03-26"  # Streamable HTTP transport
+MCP_VERSION = "2025-03-26"
 SERVER_NAME = "simplemem"
 SERVER_VERSION = "1.0.0"
 
 
 class MCPHandler:
-    """
-    Handles MCP protocol messages for a specific user session.
-    """
+    """Handles MCP protocol messages for a specific user session."""
+
+    _runtime_lock: Optional[asyncio.Lock] = None
+    _read_gate_lock: Optional[asyncio.Lock] = None
+    _active_read_ops: int = 0
+    _read_rejects: int = 0
+
+    _durable_store: Optional[DurableJobStore] = None
+    _shared_settings: Optional[Any] = None
+    _shared_vector_store: Optional[MultiTenantVectorStore] = None
+    _shared_client_manager: Optional[ClientManager] = None
+    _worker_shutdown: Optional[asyncio.Event] = None
+    _worker_tasks: list[asyncio.Task] = []
+    _lease_recoveries: int = 0
+
+    _write_stats: dict[str, int] = {
+        "accepted": 0,
+        "completed": 0,
+        "failed": 0,
+        "retryable_failures": 0,
+        "rejected_admission": 0,
+    }
+    _write_status_by_job_id: dict[str, dict[str, Any]] = {}
+    _write_status_order: deque[str] = deque()
 
     def __init__(
         self,
@@ -69,30 +96,187 @@ class MCPHandler:
         self.settings = settings
         self.initialized = False
 
-        # Lazy-loaded components
-        self._memory_builder: Optional[MemoryBuilder] = None
         self._retriever: Optional[Retriever] = None
         self._answer_generator: Optional[AnswerGenerator] = None
 
-    def _get_client(self):
-        return self.client_manager.get_client(self.api_key)
+        # Ensure class-level shared runtime is initialized once.
+        if MCPHandler._shared_vector_store is None:
+            MCPHandler._shared_vector_store = vector_store
+        if MCPHandler._shared_client_manager is None:
+            MCPHandler._shared_client_manager = client_manager
+        if MCPHandler._shared_settings is None:
+            MCPHandler._shared_settings = settings
+        if MCPHandler._durable_store is None:
+            MCPHandler._durable_store = DurableJobStore(settings.durable_queue_db_path)
+            MCPHandler._lease_recoveries += MCPHandler._durable_store.recover_expired_leases()
 
-    def _get_memory_builder(self) -> MemoryBuilder:
-        if not self._memory_builder:
-            self._memory_builder = MemoryBuilder(
-                llm_client=self._get_client(),
-                vector_store=self.vector_store,
-                table_name=self.user.table_name,
-                window_size=self.settings.window_size,
-                overlap_size=self.settings.overlap_size,
-                temperature=self.settings.llm_temperature,
+    @classmethod
+    async def start_background_workers(
+        cls,
+        *,
+        settings: Any,
+        vector_store: MultiTenantVectorStore,
+        client_manager: ClientManager,
+    ) -> None:
+        if cls._runtime_lock is None:
+            cls._runtime_lock = asyncio.Lock()
+        async with cls._runtime_lock:
+            cls._shared_settings = settings
+            cls._shared_vector_store = vector_store
+            cls._shared_client_manager = client_manager
+            if cls._durable_store is None:
+                cls._durable_store = DurableJobStore(settings.durable_queue_db_path)
+            cls._lease_recoveries += cls._durable_store.recover_expired_leases()
+            if cls._worker_shutdown is None:
+                cls._worker_shutdown = asyncio.Event()
+            cls._worker_shutdown.clear()
+            target = max(1, int(settings.memory_write_workers))
+            while len(cls._worker_tasks) < target:
+                idx = len(cls._worker_tasks) + 1
+                task = asyncio.create_task(cls._durable_worker_loop(idx), name=f"simplemem-durable-worker-{idx}")
+                cls._worker_tasks.append(task)
+
+    @classmethod
+    async def stop_background_workers(cls) -> None:
+        if cls._runtime_lock is None:
+            cls._runtime_lock = asyncio.Lock()
+        async with cls._runtime_lock:
+            if cls._worker_shutdown is not None:
+                cls._worker_shutdown.set()
+            for task in cls._worker_tasks:
+                task.cancel()
+            if cls._worker_tasks:
+                await asyncio.gather(*cls._worker_tasks, return_exceptions=True)
+            cls._worker_tasks = []
+
+    @classmethod
+    async def _durable_worker_loop(cls, worker_idx: int) -> None:
+        worker_id = f"w{worker_idx}-{uuid.uuid4().hex[:8]}"
+        while True:
+            if cls._worker_shutdown is not None and cls._worker_shutdown.is_set():
+                return
+            settings = cls._shared_settings
+            store = cls._durable_store
+            if settings is None or store is None:
+                await asyncio.sleep(0.2)
+                continue
+
+            try:
+                jobs = store.claim_batch(
+                    worker_id=worker_id,
+                    batch_size=max(1, int(settings.memory_write_batch_max)),
+                    lease_seconds=max(10, int(settings.memory_write_lease_seconds)),
+                )
+                if not jobs:
+                    await asyncio.sleep(max(0.005, int(settings.memory_write_batch_max_wait_ms) / 1000.0))
+                    continue
+
+                for job in jobs:
+                    job_id = str(job["job_id"])
+                    cls._write_status_by_job_id[job_id] = {
+                        "job_id": job_id,
+                        "kind": str(job["kind"]),
+                        "status": "processing",
+                        "started_at_utc": datetime.utcnow().isoformat(),
+                        "worker": worker_id,
+                    }
+                    cls._write_status_order.append(job_id)
+                    cls._trim_write_status(getattr(settings, "memory_write_job_status_limit", 2000))
+                    try:
+                        result = await cls._execute_durable_job(job)
+                        store.mark_done(job_id=job_id, result=result)
+                        cls._write_stats["completed"] += 1
+                        cls._write_status_by_job_id[job_id] = {
+                            "job_id": job_id,
+                            "kind": str(job["kind"]),
+                            "status": "done",
+                            "completed_at_utc": datetime.utcnow().isoformat(),
+                            "worker": worker_id,
+                            "result": result,
+                        }
+                    except Exception as exc:
+                        status = store.mark_failed(
+                            job_id=job_id,
+                            error=str(exc),
+                            retryable=True,
+                            max_retries=max(1, int(settings.memory_write_max_retries)),
+                            backoff_base_ms=max(50, int(settings.memory_write_retry_backoff_base_ms)),
+                        )
+                        if status.get("status") == "failed_retryable":
+                            cls._write_stats["retryable_failures"] += 1
+                        else:
+                            cls._write_stats["failed"] += 1
+                        cls._write_status_by_job_id[job_id] = {
+                            "job_id": job_id,
+                            "kind": str(job["kind"]),
+                            "status": status.get("status", "failed_terminal"),
+                            "completed_at_utc": datetime.utcnow().isoformat(),
+                            "worker": worker_id,
+                            "error": str(exc),
+                            "attempt_count": status.get("attempt_count"),
+                        }
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                await asyncio.sleep(0.2)
+
+    @classmethod
+    async def _execute_durable_job(cls, job: dict[str, Any]) -> dict[str, Any]:
+        settings = cls._shared_settings
+        vector_store = cls._shared_vector_store
+        client_manager = cls._shared_client_manager
+        if settings is None or vector_store is None or client_manager is None:
+            raise RuntimeError("durable_worker_not_initialized")
+
+        payload = job.get("payload", {})
+        if not isinstance(payload, dict):
+            raise RuntimeError("invalid_payload")
+        kind = str(job.get("kind", ""))
+        api_key = str(payload.get("api_key", "")).strip()
+        table_name = str(payload.get("table_name", "")).strip()
+        if not table_name:
+            raise RuntimeError("missing_table_name")
+
+        builder = MemoryBuilder(
+            llm_client=client_manager.get_client(api_key),
+            vector_store=vector_store,
+            table_name=table_name,
+            window_size=settings.window_size,
+            overlap_size=settings.overlap_size,
+            temperature=settings.llm_temperature,
+            max_retries=settings.llm_max_retries,
+        )
+
+        if kind == "memory_add":
+            speaker = str(payload.get("speaker", "")).strip()
+            content = str(payload.get("content", "")).strip()
+            if not speaker or not content:
+                raise RuntimeError("invalid_memory_add_payload")
+            return await builder.add_dialogue(
+                speaker=speaker,
+                content=content,
+                timestamp=payload.get("timestamp"),
             )
-        return self._memory_builder
+
+        if kind == "memory_add_batch":
+            dialogues = payload.get("dialogues")
+            if not isinstance(dialogues, list) or not dialogues:
+                raise RuntimeError("invalid_memory_add_batch_payload")
+            return await builder.add_dialogues(dialogues=dialogues)
+
+        raise RuntimeError(f"unsupported_job_kind:{kind}")
+
+    @classmethod
+    def _trim_write_status(cls, limit: int) -> None:
+        cap = max(100, int(limit))
+        while len(cls._write_status_order) > cap:
+            old = cls._write_status_order.popleft()
+            cls._write_status_by_job_id.pop(old, None)
 
     def _get_retriever(self) -> Retriever:
         if not self._retriever:
             self._retriever = Retriever(
-                llm_client=self._get_client(),
+                llm_client=self.client_manager.get_client(self.api_key),
                 vector_store=self.vector_store,
                 table_name=self.user.table_name,
                 semantic_top_k=self.settings.semantic_top_k,
@@ -107,13 +291,118 @@ class MCPHandler:
     def _get_answer_generator(self) -> AnswerGenerator:
         if not self._answer_generator:
             self._answer_generator = AnswerGenerator(
-                llm_client=self._get_client(),
+                llm_client=self.client_manager.get_client(self.api_key),
                 temperature=self.settings.llm_temperature,
+                max_context_entries=self.settings.memory_query_max_context_entries,
+                max_context_entry_chars=self.settings.memory_query_max_context_entry_chars,
+                max_context_total_chars=self.settings.memory_query_max_context_total_chars,
             )
         return self._answer_generator
 
+    def _compute_idempotency_key(self, *, kind: str, args: dict[str, Any]) -> str:
+        provided = str(args.get("idempotency_key", "")).strip()
+        if provided:
+            return provided[:256]
+        if kind == "memory_add":
+            content = str(args.get("content", args.get("text", ""))).strip()
+            core = {
+                "user_id": self.user.user_id,
+                "kind": kind,
+                "speaker": str(args.get("speaker", args.get("role", "user"))).strip(),
+                "content": content,
+                "timestamp": str(args.get("timestamp", "") or "").strip(),
+            }
+        else:
+            core = {
+                "user_id": self.user.user_id,
+                "kind": kind,
+                "dialogues": args.get("dialogues", []),
+            }
+        raw = json.dumps(core, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+    async def _enqueue_durable(self, *, kind: str, args: dict[str, Any]) -> dict[str, Any]:
+        store = MCPHandler._durable_store
+        if store is None:
+            raise RuntimeError("durable_queue_unavailable")
+        idem = self._compute_idempotency_key(kind=kind, args=args)
+
+        if kind == "memory_add":
+            speaker = str(args.get("speaker", args.get("role", "user"))).strip() or "user"
+            content = str(args.get("content", args.get("text", ""))).strip()
+            if not content:
+                raise ValueError("memory_add requires content or text")
+            payload = {
+                "speaker": speaker,
+                "content": content,
+                "timestamp": args.get("timestamp"),
+                "table_name": self.user.table_name,
+                "api_key": self.api_key,
+            }
+        else:
+            payload = {
+                "dialogues": args["dialogues"],
+                "table_name": self.user.table_name,
+                "api_key": self.api_key,
+            }
+
+        out = store.enqueue_or_get(
+            user_id=self.user.user_id,
+            kind=kind,
+            idempotency_key=idem,
+            payload=payload,
+            max_inflight_writes=max(10, int(self.settings.memory_queue_max_inflight_writes)),
+        )
+        if out.get("accepted"):
+            MCPHandler._write_stats["accepted"] += 1
+            job_id = str(out.get("job_id", ""))
+            if job_id:
+                MCPHandler._write_status_by_job_id[job_id] = {
+                    "job_id": job_id,
+                    "kind": kind,
+                    "status": str(out.get("status", "queued")),
+                    "updated_at_utc": datetime.utcnow().isoformat(),
+                    "idempotency_key": idem,
+                }
+                MCPHandler._write_status_order.append(job_id)
+                MCPHandler._trim_write_status(getattr(self.settings, "memory_write_job_status_limit", 2000))
+        else:
+            MCPHandler._write_stats["rejected_admission"] += 1
+        return out
+
+    async def _wait_for_job_completion(self, *, job_id: str, timeout_ms: int) -> dict[str, Any]:
+        store = MCPHandler._durable_store
+        if store is None:
+            return {"status": "unknown"}
+        timeout_s = max(0.05, int(timeout_ms) / 1000.0)
+        start = asyncio.get_running_loop().time()
+        while True:
+            job = store.get_job(job_id=job_id)
+            if not job:
+                return {"status": "missing"}
+            status = str(job.get("status", "unknown"))
+            if status in {"done", "failed_terminal"}:
+                return job
+            if (asyncio.get_running_loop().time() - start) >= timeout_s:
+                return job
+            await asyncio.sleep(0.05)
+
+    async def _enter_read_gate(self) -> None:
+        if MCPHandler._read_gate_lock is None:
+            MCPHandler._read_gate_lock = asyncio.Lock()
+        async with MCPHandler._read_gate_lock:
+            if MCPHandler._active_read_ops >= max(1, int(self.settings.memory_queue_max_inflight_reads)):
+                MCPHandler._read_rejects += 1
+                raise RuntimeError("memory_query_overloaded: read admission limit reached")
+            MCPHandler._active_read_ops += 1
+
+    async def _exit_read_gate(self) -> None:
+        if MCPHandler._read_gate_lock is None:
+            return
+        async with MCPHandler._read_gate_lock:
+            MCPHandler._active_read_ops = max(0, MCPHandler._active_read_ops - 1)
+
     async def handle_message(self, message: str) -> str:
-        """Handle a JSON-RPC message and return response"""
         try:
             data = json.loads(message)
             request = JsonRpcRequest(
@@ -124,20 +413,12 @@ class MCPHandler:
             )
             response = await self._dispatch(request)
             return json.dumps(response.to_dict(), ensure_ascii=False)
-        except json.JSONDecodeError as e:
-            return json.dumps(JsonRpcResponse(
-                error={"code": -32700, "message": f"Parse error: {e}"}
-            ).to_dict())
-        except Exception as e:
-            return json.dumps(JsonRpcResponse(
-                error={"code": -32603, "message": f"Internal error: {e}"}
-            ).to_dict())
+        except json.JSONDecodeError as exc:
+            return json.dumps(JsonRpcResponse(error={"code": -32700, "message": f"Parse error: {exc}"}).to_dict())
+        except Exception as exc:
+            return json.dumps(JsonRpcResponse(error={"code": -32603, "message": f"Internal error: {exc}"}).to_dict())
 
     async def _dispatch(self, request: JsonRpcRequest) -> JsonRpcResponse:
-        """Dispatch request to appropriate handler"""
-        method = request.method
-        params = request.params or {}
-
         handlers = {
             "initialize": self._handle_initialize,
             "initialized": self._handle_initialized,
@@ -147,289 +428,306 @@ class MCPHandler:
             "resources/list": self._handle_resources_list,
             "resources/read": self._handle_resources_read,
         }
-
-        handler = handlers.get(method)
+        handler = handlers.get(request.method)
         if not handler:
-            return JsonRpcResponse(
-                id=request.id,
-                error={"code": -32601, "message": f"Method not found: {method}"}
-            )
-
+            return JsonRpcResponse(id=request.id, error={"code": -32601, "message": f"Method not found: {request.method}"})
         try:
-            result = await handler(params)
+            result = await handler(request.params or {})
             return JsonRpcResponse(id=request.id, result=result)
-        except Exception as e:
-            return JsonRpcResponse(
-                id=request.id,
-                error={"code": -32603, "message": str(e)}
-            )
+        except Exception as exc:
+            return JsonRpcResponse(id=request.id, error={"code": -32603, "message": str(exc)})
 
     async def _handle_initialize(self, params: dict) -> dict:
-        """Handle initialize request"""
         self.initialized = True
         return {
             "protocolVersion": MCP_VERSION,
-            "capabilities": {
-                "tools": {},
-                "resources": {},
-            },
+            "capabilities": {"tools": {}, "resources": {}},
             "serverInfo": {
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION,
-                "description": "SimpleMem - Advanced Lifelong Memory System for LLM Agents. "
-                              "Features: Semantic lossless compression, coreference resolution, "
-                              "temporal anchoring, hybrid retrieval (semantic + lexical + symbolic), "
-                              "and intelligent query planning with reflection.",
+                "description": "SimpleMem durable memory system with idempotent queued writes and adaptive retrieval.",
             },
-            "instructions": """SimpleMem is your long-term memory system. Use it to:
-
-1. STORE conversations: Use memory_add or memory_add_batch to save dialogues.
-   The system automatically extracts facts, resolves pronouns, and anchors timestamps.
-   Memories are stored immediately - no manual flush needed.
-
-2. RECALL information: Use memory_query to ask questions about past conversations.
-   The system retrieves relevant memories and synthesizes answers.
-
-3. BROWSE memories: Use memory_retrieve to see raw stored facts with metadata.
-
-4. MANAGE: Use memory_stats to check status, memory_clear to reset (careful!).
-
-Tips:
-- Use memory_query for natural questions, memory_retrieve for browsing
-- Each memory_add call processes and stores data immediately""",
+            "instructions": (
+                "Use memory_add/memory_add_batch for durable writes. "
+                "Writes are accepted only after durable enqueue and return a job_id. "
+                "Use memory_job_status for completion state."
+            ),
         }
 
     async def _handle_initialized(self, params: dict) -> dict:
-        """Handle initialized notification"""
         return {}
 
     async def _handle_ping(self, params: dict) -> dict:
-        """Handle ping request"""
         return {}
 
     async def _handle_tools_list(self, params: dict) -> dict:
-        """Handle tools/list request"""
         return {
             "tools": [
                 {
                     "name": "memory_add",
-                    "description": """Add a dialogue to SimpleMem long-term memory system.
-
-SimpleMem is an advanced lifelong memory system that:
-- Stores conversations as atomic, self-contained facts (no pronouns, absolute timestamps)
-- Uses semantic compression to extract key information (persons, locations, entities, topics)
-- Supports hybrid retrieval (semantic + keyword + metadata filtering)
-
-The dialogue is processed immediately by LLM and stored. No manual flush needed.
-
-Example: memory_add(speaker="Alice", content="I'll meet Bob at Starbucks tomorrow at 2pm")
-→ Stored as: "Alice will meet Bob at Starbucks on 2025-01-14 at 14:00"
-   with metadata: persons=["Alice","Bob"], location="Starbucks", topic="Meeting arrangement\"""",
+                    "description": "Durably enqueue a single dialogue for memory extraction and indexing.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "speaker": {
-                                "type": "string",
-                                "description": "Name of the speaker (will be used for coreference resolution)",
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "Content of the dialogue (pronouns will be resolved, relative times will be converted to absolute)",
-                            },
-                            "timestamp": {
-                                "type": "string",
-                                "description": "ISO 8601 timestamp of when this was said (used for temporal anchoring). Defaults to now.",
-                            },
+                            "user_id": {"type": "string", "description": "Optional; ignored in authenticated mode"},
+                            "speaker": {"type": "string", "description": "Speaker name (defaults to 'user')"},
+                            "role": {"type": "string", "description": "Alias of speaker"},
+                            "content": {"type": "string", "description": "Dialogue content"},
+                            "text": {"type": "string", "description": "Alias of content for compatibility"},
+                            "metadata": {"type": "object", "description": "Optional metadata passthrough"},
+                            "timestamp": {"type": "string", "description": "ISO timestamp"},
+                            "sync": {"type": "boolean", "description": "Wait briefly for completion after durable accept"},
+                            "idempotency_key": {"type": "string", "description": "Optional idempotency key"},
                         },
-                        "required": ["speaker", "content"],
+                        "required": [],
                     },
                 },
                 {
                     "name": "memory_add_batch",
-                    "description": """Add multiple dialogues to SimpleMem at once.
-
-Efficient for importing conversation history. Each dialogue is processed with:
-- Coreference resolution (he/she → actual names)
-- Temporal anchoring (tomorrow → actual date)
-- Entity extraction (persons, locations, organizations)
-
-All dialogues are processed immediately and stored. No manual flush needed.""",
+                    "description": "Durably enqueue a batch of dialogues for background processing.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "dialogues": {
                                 "type": "array",
-                                "description": "List of dialogues to add",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "speaker": {"type": "string", "description": "Speaker name"},
-                                        "content": {"type": "string", "description": "Dialogue content"},
-                                        "timestamp": {"type": "string", "description": "ISO 8601 timestamp"},
+                                        "speaker": {"type": "string"},
+                                        "content": {"type": "string"},
+                                        "timestamp": {"type": "string"},
                                     },
                                     "required": ["speaker", "content"],
                                 },
                             },
+                            "sync": {"type": "boolean", "description": "Wait briefly for completion after durable accept"},
+                            "idempotency_key": {"type": "string", "description": "Optional idempotency key"},
                         },
                         "required": ["dialogues"],
                     },
                 },
                 {
+                    "name": "memory_job_status",
+                    "description": "Return status for a previously accepted durable write job.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"job_id": {"type": "string"}},
+                        "required": ["job_id"],
+                    },
+                },
+                {
                     "name": "memory_query",
-                    "description": """Query SimpleMem and get an AI-generated answer based on stored memories.
-
-This is the primary way to retrieve information from long-term memory. The system:
-1. Analyzes query complexity (simple fact vs multi-hop reasoning)
-2. Generates targeted search queries
-3. Performs hybrid retrieval (semantic similarity + keyword matching + metadata filtering)
-4. Optionally reflects to find missing information for complex queries
-5. Synthesizes a concise answer from retrieved contexts
-
-Best for: "When did Alice and Bob plan to meet?", "What does Alice think about the project?", "Summarize recent events with Bob"
-
-Returns: answer, reasoning, confidence level, and number of memory entries used.""",
+                    "description": "Query stored memories and synthesize answer.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "question": {
-                                "type": "string",
-                                "description": "Natural language question about stored memories",
-                            },
-                            "enable_reflection": {
-                                "type": "boolean",
-                                "description": "Enable iterative refinement for complex multi-hop queries. Default: true. Disable for simple factual lookups to save tokens.",
-                            },
+                            "user_id": {"type": "string", "description": "Optional; ignored in authenticated mode"},
+                            "question": {"type": "string", "description": "Query text"},
+                            "query": {"type": "string", "description": "Alias of question for compatibility"},
+                            "enable_reflection": {"type": "boolean"},
+                            "enable_planning": {"type": "boolean"},
+                            "limit": {"type": "integer", "description": "Alias of top_k"},
+                            "top_k": {"type": "integer"},
                         },
-                        "required": ["question"],
+                        "required": [],
                     },
                 },
                 {
                     "name": "memory_retrieve",
-                    "description": """Retrieve relevant memory entries without generating an answer.
-
-Returns raw memory entries with full metadata. Use this when you need:
-- Direct access to stored facts
-- To process/analyze memories yourself
-- To show the user what's stored about a topic
-
-Each entry contains: content (self-contained fact), timestamp, location, persons, entities, topic.""",
+                    "description": "Retrieve relevant memory entries without synthesis.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Search query (semantic search + keyword matching)",
-                            },
-                            "top_k": {
-                                "type": "integer",
-                                "description": "Maximum number of entries to return. Default: 10",
-                            },
+                            "user_id": {"type": "string", "description": "Optional; ignored in authenticated mode"},
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer", "description": "Alias of top_k"},
+                            "top_k": {"type": "integer"},
                         },
                         "required": ["query"],
                     },
                 },
                 {
                     "name": "memory_clear",
-                    "description": """Clear ALL memories for this user. This action CANNOT be undone.
-
-Use with caution. This removes all stored memory entries from the vector database.""",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                    },
+                    "description": "Clear all memories for this user.",
+                    "inputSchema": {"type": "object", "properties": {}},
                 },
                 {
                     "name": "memory_stats",
-                    "description": """Get statistics about the memory store.
-
-Returns:
-- Total number of stored memory entries
-- User ID and table info
-
-Use to check if memories are being stored correctly.""",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                    },
+                    "description": "Return memory and queue statistics.",
+                    "inputSchema": {"type": "object", "properties": {}},
                 },
             ]
         }
 
     async def _handle_tools_call(self, params: dict) -> dict:
-        """Handle tools/call request"""
         name = params.get("name", "")
         arguments = params.get("arguments", {})
-
-        tool_handlers = {
+        handlers = {
             "memory_add": self._tool_memory_add,
             "memory_add_batch": self._tool_memory_add_batch,
+            "memory_job_status": self._tool_memory_job_status,
             "memory_query": self._tool_memory_query,
             "memory_retrieve": self._tool_memory_retrieve,
             "memory_clear": self._tool_memory_clear,
             "memory_stats": self._tool_memory_stats,
         }
-
-        handler = tool_handlers.get(name)
+        handler = handlers.get(name)
         if not handler:
             raise ValueError(f"Unknown tool: {name}")
-
         result = await handler(arguments)
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps(result, ensure_ascii=False, indent=2),
-                }
-            ]
-        }
+        return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
     async def _tool_memory_add(self, args: dict) -> dict:
-        builder = self._get_memory_builder()
-        return await builder.add_dialogue(
-            speaker=args["speaker"],
-            content=args["content"],
-            timestamp=args.get("timestamp"),
-        )
+        queued = await self._enqueue_durable(kind="memory_add", args=args)
+        if not queued.get("accepted"):
+            return {
+                "accepted": False,
+                "durable": False,
+                "status": "rejected_overloaded",
+                "reason": queued.get("reason", "memory_write_admission_limit"),
+                "retryable": bool(queued.get("retryable", True)),
+            }
 
-    async def _tool_memory_add_batch(self, args: dict) -> dict:
-        builder = self._get_memory_builder()
-        return await builder.add_dialogues(
-            dialogues=args["dialogues"],
-        )
-
-    async def _tool_memory_query(self, args: dict) -> dict:
-        retriever = self._get_retriever()
-        generator = self._get_answer_generator()
-
-        contexts = await retriever.retrieve(
-            query=args["question"],
-            enable_reflection=args.get("enable_reflection", True),
-        )
-
-        answer_result = await generator.generate_answer(
-            query=args["question"],
-            contexts=contexts,
-        )
-
-        return {
-            "question": args["question"],
-            "answer": answer_result["answer"],
-            "reasoning": answer_result["reasoning"],
-            "confidence": answer_result["confidence"],
-            "contexts_used": len(contexts),
+        out = {
+            "accepted": True,
+            "durable": True,
+            "status": str(queued.get("status", "queued")),
+            "job_id": str(queued.get("job_id", "")),
+            "idempotency_key": str(queued.get("idempotency_key", "")),
+            "existing": bool(queued.get("existing", False)),
         }
 
-    async def _tool_memory_retrieve(self, args: dict) -> dict:
-        retriever = self._get_retriever()
-        top_k = args.get("top_k", 10)
+        force_sync = bool(args.get("sync", False)) or (not bool(self.settings.memory_add_async_default))
+        if not force_sync:
+            return out
 
-        entries = await retriever.retrieve(
-            query=args["query"],
-            enable_reflection=False,
+        waited = await self._wait_for_job_completion(
+            job_id=out["job_id"],
+            timeout_ms=max(50, int(self.settings.memory_sync_wait_timeout_ms)),
         )
+        status = str(waited.get("status", "processing"))
+        if status == "done":
+            out["status"] = "done"
+            out["result"] = waited.get("result")
+        elif status == "failed_terminal":
+            out["status"] = "failed_terminal"
+            out["error"] = waited.get("last_error")
+        else:
+            out["status"] = "accepted_processing"
+        return out
 
+    async def _tool_memory_add_batch(self, args: dict) -> dict:
+        queued = await self._enqueue_durable(kind="memory_add_batch", args=args)
+        if not queued.get("accepted"):
+            return {
+                "accepted": False,
+                "durable": False,
+                "status": "rejected_overloaded",
+                "reason": queued.get("reason", "memory_write_admission_limit"),
+                "retryable": bool(queued.get("retryable", True)),
+            }
+
+        out = {
+            "accepted": True,
+            "durable": True,
+            "status": str(queued.get("status", "queued")),
+            "job_id": str(queued.get("job_id", "")),
+            "idempotency_key": str(queued.get("idempotency_key", "")),
+            "existing": bool(queued.get("existing", False)),
+        }
+
+        force_sync = bool(args.get("sync", False)) or (not bool(self.settings.memory_add_async_default))
+        if not force_sync:
+            return out
+
+        waited = await self._wait_for_job_completion(
+            job_id=out["job_id"],
+            timeout_ms=max(50, int(self.settings.memory_sync_wait_timeout_ms)),
+        )
+        status = str(waited.get("status", "processing"))
+        if status == "done":
+            out["status"] = "done"
+            out["result"] = waited.get("result")
+        elif status == "failed_terminal":
+            out["status"] = "failed_terminal"
+            out["error"] = waited.get("last_error")
+        else:
+            out["status"] = "accepted_processing"
+        return out
+
+    async def _tool_memory_job_status(self, args: dict) -> dict:
+        job_id = str(args.get("job_id", "")).strip()
+        if not job_id:
+            return {"found": False, "error": "job_id_required"}
+        store = MCPHandler._durable_store
+        if store is None:
+            return {"found": False, "error": "durable_queue_unavailable"}
+        row = store.get_job(job_id=job_id)
+        if not row:
+            return {"found": False, "job_id": job_id}
+        if row.get("user_id") != self.user.user_id:
+            return {"found": False, "job_id": job_id}
+        return {"found": True, **row}
+
+    async def _tool_memory_query(self, args: dict) -> dict:
+        await self._enter_read_gate()
+        try:
+            question = str(args.get("question", args.get("query", ""))).strip()
+            if not question:
+                raise ValueError("memory_query requires question or query")
+            retriever = self._get_retriever()
+            generator = self._get_answer_generator()
+            requested_top_k = args.get("top_k", args.get("limit", self.settings.memory_query_default_top_k))
+            try:
+                requested_top_k = int(requested_top_k)
+            except Exception:
+                requested_top_k = self.settings.memory_query_default_top_k
+            top_k = max(1, min(requested_top_k, self.settings.memory_query_max_top_k))
+
+            contexts = await retriever.retrieve(
+                query=question,
+                enable_reflection=args.get("enable_reflection", self.settings.enable_reflection),
+                enable_planning=args.get("enable_planning", self.settings.enable_planning),
+            )
+            contexts = contexts[:top_k]
+
+            answer_result = await generator.generate_answer(query=question, contexts=contexts)
+            answer_text = str(answer_result.get("answer", ""))
+            reasoning_text = str(answer_result.get("reasoning", ""))
+            if "error occurred while generating the answer" in answer_text.lower():
+                snippets = [str(e.lossless_restatement or "").strip() for e in contexts[:3] if str(e.lossless_restatement or "").strip()]
+                if snippets:
+                    fallback = " | ".join(snippets)
+                    answer_result = {
+                        "answer": fallback[:700],
+                        "reasoning": f"Fallback summary from memory_retrieve contexts. Original synthesis failure: {reasoning_text[:220]}",
+                        "confidence": "low",
+                    }
+
+            return {
+                "question": question,
+                "answer": answer_result.get("answer", ""),
+                "reasoning": answer_result.get("reasoning", ""),
+                "confidence": answer_result.get("confidence", "low"),
+                "contexts_used": len(contexts),
+                "top_k": top_k,
+            }
+        finally:
+            await self._exit_read_gate()
+
+    async def _tool_memory_retrieve(self, args: dict) -> dict:
+        query = str(args.get("query", "")).strip()
+        if not query:
+            raise ValueError("memory_retrieve requires query")
+        retriever = self._get_retriever()
+        top_k = int(args.get("top_k", args.get("limit", 10)))
+        entries = await retriever.retrieve(
+            query=query,
+            enable_reflection=False,
+            enable_planning=False,
+        )
         return {
-            "query": args["query"],
+            "query": query,
             "results": [
                 {
                     "content": e.lossless_restatement,
@@ -446,23 +744,53 @@ Use to check if memories are being stored correctly.""",
 
     async def _tool_memory_clear(self, args: dict) -> dict:
         success = await self.vector_store.clear_table(self.user.table_name)
-        return {
-            "success": success,
-            "message": "All memories cleared" if success else "Failed",
-        }
+        return {"success": success, "message": "All memories cleared" if success else "Failed"}
 
     async def _tool_memory_stats(self, args: dict) -> dict:
         stats = self.vector_store.get_stats(self.user.table_name)
-        builder = self._get_memory_builder()
-        builder_stats = builder.get_stats()
+        store = MCPHandler._durable_store
+        durable = store.queue_counts() if store is not None else {}
+        pending = int(durable.get("pending", 0))
+        processing = int(durable.get("processing", 0))
+        done = int(durable.get("done", 0))
+        failed_retryable = int(durable.get("failed_retryable", 0))
+        failed_terminal = int(durable.get("failed_terminal", 0))
+        oldest_pending_age_s = durable.get("oldest_pending_age_s")
+        retry_rate_window = (
+            MCPHandler._write_stats["retryable_failures"] / max(1, MCPHandler._write_stats["accepted"])
+        )
+        write_queue = {
+            **durable,
+            "workers": len(MCPHandler._worker_tasks),
+            "accepted_total": MCPHandler._write_stats["accepted"],
+            "completed_total": MCPHandler._write_stats["completed"],
+            "failed_total": MCPHandler._write_stats["failed"],
+            "retryable_failures_total": MCPHandler._write_stats["retryable_failures"],
+            "rejected_admission_total": MCPHandler._write_stats["rejected_admission"],
+            "active_read_ops": MCPHandler._active_read_ops,
+            "lease_recoveries_total": MCPHandler._lease_recoveries,
+        }
         return {
             "user_id": self.user.user_id,
             "entry_count": stats.get("entry_count", 0),
-            "total_dialogues_processed": builder_stats.get("total_dialogues_processed", 0),
+            "durable_queue": {
+                "pending": pending,
+                "processing": processing,
+                "done": done,
+                "failed_retryable": failed_retryable,
+                "failed_terminal": failed_terminal,
+                "oldest_pending_age_s": oldest_pending_age_s,
+                "retry_rate_window": retry_rate_window,
+                "lease_timeout_recoveries": MCPHandler._lease_recoveries,
+                "queue_admission_rejects": MCPHandler._write_stats["rejected_admission"],
+            },
+            "durable_workers_running": len(MCPHandler._worker_tasks),
+            "admission_rejects_read": MCPHandler._read_rejects,
+            "admission_rejects_write": MCPHandler._write_stats["rejected_admission"],
+            "write_queue": write_queue,
         }
 
     async def _handle_resources_list(self, params: dict) -> dict:
-        """Handle resources/list request"""
         return {
             "resources": [
                 {
@@ -481,27 +809,12 @@ Use to check if memories are being stored correctly.""",
         }
 
     async def _handle_resources_read(self, params: dict) -> dict:
-        """Handle resources/read request"""
         uri = params.get("uri", "")
-
         if uri.endswith("/stats"):
-            stats = self.vector_store.get_stats(self.user.table_name)
-            content = json.dumps(stats, ensure_ascii=False)
+            content = json.dumps(self.vector_store.get_stats(self.user.table_name), ensure_ascii=False)
         elif uri.endswith("/all"):
             entries = await self.vector_store.get_all_entries(self.user.table_name)
-            content = json.dumps({
-                "entries": [e.to_dict() for e in entries],
-                "total": len(entries),
-            }, ensure_ascii=False)
+            content = json.dumps({"entries": [e.to_dict() for e in entries], "total": len(entries)}, ensure_ascii=False)
         else:
             raise ValueError(f"Unknown resource: {uri}")
-
-        return {
-            "contents": [
-                {
-                    "uri": uri,
-                    "mimeType": "application/json",
-                    "text": content,
-                }
-            ]
-        }
+        return {"contents": [{"uri": uri, "mimeType": "application/json", "text": content}]}

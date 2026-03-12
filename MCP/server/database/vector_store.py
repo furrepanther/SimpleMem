@@ -4,6 +4,7 @@ Uses LanceDB for vector storage with per-user table isolation
 """
 
 import os
+import asyncio
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
@@ -50,6 +51,55 @@ class MultiTenantVectorStore:
 
         # Cache for opened tables
         self._tables: Dict[str, Any] = {}
+        # Cache effective vector dimension per table (schema-derived when available)
+        self._table_dimensions: Dict[str, int] = {}
+
+    def _infer_table_dimension(self, table: Any) -> int:
+        """Infer vector dimension from table schema; fall back to configured dimension."""
+        try:
+            schema = table.schema
+            if hasattr(schema, "names") and "vector" in schema.names:
+                vector_field = schema.field("vector")
+                vector_type = getattr(vector_field, "type", None)
+                size = getattr(vector_type, "list_size", None)
+                if isinstance(size, int) and size > 0:
+                    return size
+        except Exception:
+            pass
+        return self.embedding_dimension
+
+    def _get_table_dimension(self, table_name: str, table: Any) -> int:
+        """Get cached dimension for table, deriving from schema if needed."""
+        if table_name in self._table_dimensions:
+            return self._table_dimensions[table_name]
+        dim = self._infer_table_dimension(table)
+        self._table_dimensions[table_name] = dim
+        return dim
+
+    @staticmethod
+    def _adapt_vector(vector: List[float], target_dim: int) -> List[float]:
+        """
+        Adapt vector length to table schema:
+        - truncate if source is longer
+        - zero-pad if source is shorter
+        """
+        if target_dim <= 0:
+            return [float(v) for v in vector]
+        out = [float(v) for v in vector[:target_dim]]
+        missing = target_dim - len(out)
+        if missing > 0:
+            out.extend([0.0] * missing)
+        return out
+
+    @staticmethod
+    def _list_or_empty(value: Any) -> List[Any]:
+        """Safely normalize DB row values that may be arrays/lists/None."""
+        if value is None:
+            return []
+        try:
+            return list(value)
+        except Exception:
+            return []
 
     def _get_table(self, table_name: str) -> Any:
         """Get or create a user's table"""
@@ -63,6 +113,7 @@ class MultiTenantVectorStore:
                     table_name,
                     schema=schema,
                 )
+            self._table_dimensions[table_name] = self._infer_table_dimension(self._tables[table_name])
         return self._tables[table_name]
 
     async def add_entries(
@@ -88,7 +139,8 @@ class MultiTenantVectorStore:
         if not entries:
             return 0
 
-        table = self._get_table(table_name)
+        table = await asyncio.to_thread(self._get_table, table_name)
+        table_dim = self._get_table_dimension(table_name, table)
         created_at = datetime.utcnow().isoformat()
 
         # Build records
@@ -103,12 +155,12 @@ class MultiTenantVectorStore:
                 "persons": entry.persons or [],
                 "entities": entry.entities or [],
                 "topic": entry.topic or "",
-                "vector": embedding,
+                "vector": self._adapt_vector(embedding, table_dim),
                 "created_at": created_at,
             })
 
         # Add to table
-        table.add(records)
+        await asyncio.to_thread(table.add, records)
         return len(records)
 
     async def semantic_search(
@@ -128,17 +180,16 @@ class MultiTenantVectorStore:
         Returns:
             List of matching MemoryEntry objects
         """
-        table = self._get_table(table_name)
+        table = await asyncio.to_thread(self._get_table, table_name)
+        table_dim = self._get_table_dimension(table_name, table)
 
         try:
             # Check if table has data
-            if table.count_rows() == 0:
+            if await asyncio.to_thread(table.count_rows) == 0:
                 return []
-
-            results = (
-                table.search(query_embedding)
-                .limit(top_k)
-                .to_pandas()
+            query_vec = self._adapt_vector(query_embedding, table_dim)
+            results = await asyncio.to_thread(
+                lambda: table.search(query_vec).limit(top_k).to_pandas()
             )
 
             entries = []
@@ -177,20 +228,21 @@ class MultiTenantVectorStore:
         Returns:
             List of matching MemoryEntry objects
         """
-        table = self._get_table(table_name)
+        table = await asyncio.to_thread(self._get_table, table_name)
 
         try:
-            if table.count_rows() == 0:
+            if await asyncio.to_thread(table.count_rows) == 0:
                 return []
 
             # Load all entries for keyword matching
-            df = table.to_pandas()
+            df = await asyncio.to_thread(table.to_pandas)
 
             # Score each entry
             scores = []
             for idx, row in df.iterrows():
                 score = 0
-                entry_keywords = set(k.lower() for k in (row["keywords"] or []))
+                row_keywords = self._list_or_empty(row["keywords"])
+                entry_keywords = set(str(k).lower() for k in row_keywords)
                 entry_text = row["lossless_restatement"].lower()
 
                 for kw in keywords:
@@ -253,13 +305,13 @@ class MultiTenantVectorStore:
         Returns:
             List of matching MemoryEntry objects
         """
-        table = self._get_table(table_name)
+        table = await asyncio.to_thread(self._get_table, table_name)
 
         try:
-            if table.count_rows() == 0:
+            if await asyncio.to_thread(table.count_rows) == 0:
                 return []
 
-            df = table.to_pandas()
+            df = await asyncio.to_thread(table.to_pandas)
 
             # Apply filters
             mask = [True] * len(df)
@@ -267,7 +319,7 @@ class MultiTenantVectorStore:
             if persons:
                 persons_lower = set(p.lower() for p in persons)
                 for i, row in df.iterrows():
-                    row_persons = set(p.lower() for p in (row["persons"] or []))
+                    row_persons = set(str(p).lower() for p in self._list_or_empty(row["persons"]))
                     if not persons_lower.intersection(row_persons):
                         mask[i] = False
 
@@ -284,7 +336,7 @@ class MultiTenantVectorStore:
                 entities_lower = set(e.lower() for e in entities)
                 for i, row in df.iterrows():
                     if mask[i]:
-                        row_entities = set(e.lower() for e in (row["entities"] or []))
+                        row_entities = set(str(e).lower() for e in self._list_or_empty(row["entities"]))
                         if not entities_lower.intersection(row_entities):
                             mask[i] = False
 
@@ -324,13 +376,13 @@ class MultiTenantVectorStore:
 
     async def get_all_entries(self, table_name: str) -> List[MemoryEntry]:
         """Get all entries from a user's table"""
-        table = self._get_table(table_name)
+        table = await asyncio.to_thread(self._get_table, table_name)
 
         try:
-            if table.count_rows() == 0:
+            if await asyncio.to_thread(table.count_rows) == 0:
                 return []
 
-            df = table.to_pandas()
+            df = await asyncio.to_thread(table.to_pandas)
             entries = []
 
             for _, row in df.iterrows():
@@ -353,9 +405,9 @@ class MultiTenantVectorStore:
 
     async def count_entries(self, table_name: str) -> int:
         """Count entries in a user's table"""
-        table = self._get_table(table_name)
+        table = await asyncio.to_thread(self._get_table, table_name)
         try:
-            return table.count_rows()
+            return int(await asyncio.to_thread(table.count_rows))
         except Exception:
             return 0
 

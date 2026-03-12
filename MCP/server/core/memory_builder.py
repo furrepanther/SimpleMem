@@ -34,6 +34,7 @@ class MemoryBuilder:
         window_size: int = 40,  # Max dialogues per LLM call
         overlap_size: int = 2,
         temperature: float = 0.1,
+        max_retries: int = 3,
     ):
         self.client = llm_client
         self.vector_store = vector_store
@@ -41,6 +42,7 @@ class MemoryBuilder:
         self.window_size = window_size
         self.overlap_size = overlap_size
         self.temperature = temperature
+        self.max_retries = max(1, int(max_retries))
 
         # Context from previous processing for deduplication
         self._previous_context: str = ""
@@ -201,7 +203,7 @@ class MemoryBuilder:
         ]
 
         # Retry mechanism
-        max_retries = 3
+        max_retries = self.max_retries
         for attempt in range(max_retries):
             try:
                 response = await self.client.chat_completion(

@@ -63,6 +63,7 @@ class Retriever:
         self,
         query: str,
         enable_reflection: Optional[bool] = None,
+        enable_planning: Optional[bool] = None,
     ) -> List[MemoryEntry]:
         """
         Retrieve relevant memory entries for a query
@@ -80,7 +81,13 @@ class Retriever:
             else self.enable_reflection
         )
 
-        if self.enable_planning:
+        use_planning = (
+            enable_planning
+            if enable_planning is not None
+            else self.enable_planning
+        )
+
+        if use_planning:
             return await self._retrieve_with_planning(query, use_reflection)
         else:
             return await self._simple_retrieve(query)

@@ -3,7 +3,10 @@ Ollama SDK integration for LLM and Embedding services
 """
 
 import json
+import asyncio
+import random
 import re
+import time
 from typing import List, Dict, Any, Optional
 
 
@@ -24,10 +27,58 @@ class OllamaClient:
         self.embedding_base_url = (embedding_base_url or base_url).rstrip("/")
         self.llm_model = llm_model
         self.embedding_model = embedding_model
+        self._retry_delays_s = [0.25, 0.5, 1.0, 2.0, 4.0]
+        self._breaker_open_until: dict[str, float] = {"chat": 0.0, "embed": 0.0}
+        self._breaker_429_streak: dict[str, int] = {"chat": 0, "embed": 0}
+        self._breaker_threshold = 3
+        self._breaker_cooldown_s = 8.0
 
         # Lazy import to avoid issues if not installed
         self._chat_client = None
         self._embed_client = None
+
+    def _ensure_lane_open(self, lane: str) -> None:
+        now = time.monotonic()
+        open_until = float(self._breaker_open_until.get(lane, 0.0))
+        if now < open_until:
+            raise RuntimeError(f"circuit_open:{lane}:retry_after_s={round(open_until - now, 2)}")
+
+    def _note_success(self, lane: str) -> None:
+        self._breaker_429_streak[lane] = 0
+        self._breaker_open_until[lane] = 0.0
+
+    def _note_429(self, lane: str) -> None:
+        streak = int(self._breaker_429_streak.get(lane, 0)) + 1
+        self._breaker_429_streak[lane] = streak
+        if streak >= self._breaker_threshold:
+            self._breaker_open_until[lane] = time.monotonic() + self._breaker_cooldown_s
+
+    async def _post_with_retry(self, *, lane: str, client: Any, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_lane_open(lane)
+        last_exc: Exception | None = None
+        for idx, delay in enumerate(self._retry_delays_s, start=1):
+            try:
+                resp = await client.post(path, json=payload)
+                if resp.status_code == 429:
+                    self._note_429(lane)
+                    jitter = random.uniform(0.0, 0.25)
+                    await asyncio.sleep(delay + jitter)
+                    continue
+                resp.raise_for_status()
+                self._note_success(lane)
+                return resp.json()
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc).lower()
+                retryable = "429" in msg or "503" in msg or "502" in msg or "timeout" in msg or "connection" in msg
+                if not retryable or idx >= len(self._retry_delays_s):
+                    break
+                jitter = random.uniform(0.0, 0.25)
+                await asyncio.sleep(delay + jitter)
+                continue
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("request_failed_without_exception")
 
     def _get_chat_client(self):
         """Get or create chat client."""
@@ -104,10 +155,12 @@ class OllamaClient:
         if stream:
             return await self._stream_completion(payload)
 
-        response = await client.post("/chat/completions", json=payload)
-        response.raise_for_status()
-        data = response.json()
-
+        data = await self._post_with_retry(
+            lane="chat",
+            client=client,
+            path="/chat/completions",
+            payload=payload,
+        )
         return data["choices"][0]["message"]["content"]
 
     async def _stream_completion(self, payload: Dict) -> str:
@@ -149,21 +202,36 @@ class OllamaClient:
         """
         client = self._get_embed_client()
 
-        # Ollama uses /embeddings endpoint for single text
-        # For multiple texts, we need to call it multiple times
-        embeddings = []
+        payload = {"model": self.embedding_model, "input": texts}
+        data = await self._post_with_retry(
+            lane="embed",
+            client=client,
+            path="/embeddings",
+            payload=payload,
+        )
+        rows = data.get("data", [])
+        if not isinstance(rows, list):
+            raise RuntimeError("invalid_embedding_response")
+        out: list[list[float]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            emb = row.get("embedding")
+            if isinstance(emb, list):
+                out.append(emb)
+        if len(out) == len(texts):
+            return out
+        # Fallback to per-item if server returned unexpected shape.
+        fallback: list[list[float]] = []
         for text in texts:
-            payload = {
-                "model": self.embedding_model,
-                "input": text,
-            }
-
-            response = await client.post("/embeddings", json=payload)
-            response.raise_for_status()
-            data = response.json()
-            embeddings.append(data["data"][0]["embedding"])
-
-        return embeddings
+            row_data = await self._post_with_retry(
+                lane="embed",
+                client=client,
+                path="/embeddings",
+                payload={"model": self.embedding_model, "input": text},
+            )
+            fallback.append(row_data["data"][0]["embedding"])
+        return fallback
 
     async def create_single_embedding(self, text: str) -> List[float]:
         """Create embedding for a single text"""

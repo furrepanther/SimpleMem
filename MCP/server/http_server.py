@@ -47,6 +47,7 @@ from config.settings import get_settings
 
 class RegisterRequest(BaseModel):
     openrouter_api_key: str
+    user_id: Optional[str] = None
 
 
 class RegisterResponse(BaseModel):
@@ -252,6 +253,11 @@ async def lifespan(app: FastAPI):
     print(f"  - Embedding Model: {settings.embedding_model}")
     print(f"  - Window Size: {settings.window_size}")
     print(f"  - Transport: Streamable HTTP (2025-03-26)")
+    await MCPHandler.start_background_workers(
+        settings=settings,
+        vector_store=vector_store,
+        client_manager=client_manager,
+    )
 
     # Start session cleanup task
     cleanup_task = asyncio.create_task(session_cleanup_task())
@@ -264,6 +270,7 @@ async def lifespan(app: FastAPI):
         await cleanup_task
     except asyncio.CancelledError:
         pass
+    await MCPHandler.stop_background_workers()
 
     print("SimpleMem MCP Server stopped")
 
@@ -293,6 +300,7 @@ async def register(request: RegisterRequest):
     """Register a new user with API key (or placeholder for Ollama)"""
     try:
         api_key = request.openrouter_api_key
+        requested_user_id = (request.user_id or "").strip()
 
         # For Ollama, we don't need a real API key, use a placeholder
         if settings.llm_provider == "ollama":
@@ -325,12 +333,25 @@ async def register(request: RegisterRequest):
                     error=f"Invalid OpenRouter API key: {error}",
                 )
 
-        # Create user
-        user = User()
-        user.openrouter_api_key_encrypted = token_manager.encrypt_api_key(api_key)
-
-        # Save user
-        user_store.create_user(user)
+        # Resolve target user:
+        # - when user_id is provided, upsert that specific user
+        # - otherwise preserve prior behavior (new random user)
+        encrypted_api_key = token_manager.encrypt_api_key(api_key)
+        if requested_user_id:
+            existing_user = user_store.get_user(requested_user_id)
+            if existing_user:
+                user_store.update_api_key(requested_user_id, encrypted_api_key)
+                user = user_store.get_user(requested_user_id)
+                if not user:
+                    raise RuntimeError(f"Failed to reload user after update: {requested_user_id}")
+            else:
+                user = User(user_id=requested_user_id)
+                user.openrouter_api_key_encrypted = encrypted_api_key
+                user_store.create_user(user)
+        else:
+            user = User()
+            user.openrouter_api_key_encrypted = encrypted_api_key
+            user_store.create_user(user)
 
         # Generate token
         token = token_manager.generate_token(user)

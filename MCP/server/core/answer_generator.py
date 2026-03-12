@@ -21,9 +21,15 @@ class AnswerGenerator:
         self,
         llm_client: LLMClient,
         temperature: float = 0.1,
+        max_context_entries: int = 10,
+        max_context_entry_chars: int = 320,
+        max_context_total_chars: int = 3500,
     ):
         self.client = llm_client
         self.temperature = temperature
+        self.max_context_entries = max(1, int(max_context_entries))
+        self.max_context_entry_chars = max(80, int(max_context_entry_chars))
+        self.max_context_total_chars = max(self.max_context_entry_chars, int(max_context_total_chars))
 
     async def generate_answer(
         self,
@@ -98,12 +104,19 @@ class AnswerGenerator:
             "confidence": "low",
         }
 
+    def _truncate_text(self, text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 16)] + " ...[truncated]"
+
     def _format_contexts(self, contexts: List[MemoryEntry]) -> str:
         """Format memory entries into readable context"""
         formatted = []
+        total_chars = 0
 
-        for i, entry in enumerate(contexts[:30], 1):  # Limit to 30 entries
-            parts = [f"[{i}] {entry.lossless_restatement}"]
+        for i, entry in enumerate(contexts[: self.max_context_entries], 1):
+            statement = self._truncate_text(entry.lossless_restatement or "", self.max_context_entry_chars)
+            parts = [f"[{i}] {statement}"]
 
             metadata = []
             if entry.timestamp:
@@ -120,7 +133,15 @@ class AnswerGenerator:
             if metadata:
                 parts.append(f"   ({'; '.join(metadata)})")
 
-            formatted.append("\n".join(parts))
+            block = "\n".join(parts)
+            if total_chars + len(block) > self.max_context_total_chars:
+                remaining = self.max_context_total_chars - total_chars
+                if remaining > 120:
+                    formatted.append(self._truncate_text(block, remaining))
+                formatted.append("...[context budget reached]")
+                break
+            formatted.append(block)
+            total_chars += len(block)
 
         return "\n\n".join(formatted)
 
