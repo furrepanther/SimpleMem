@@ -2,7 +2,9 @@
 import json
 import logging
 import sqlite3
+import threading
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from types import TracebackType
@@ -35,10 +37,15 @@ class SQLiteStorage:
     def __init__(self, db_path: str = "~/.simplemem-cross/cross_memory.db"):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._configure_connection()
         self._run_migrations()
+
+    @property
+    def _write_lock(self):
+        return self._lock
 
     def __enter__(self) -> "SQLiteStorage":
         return self
@@ -56,6 +63,16 @@ class SQLiteStorage:
             self.conn.close()
         except sqlite3.Error:
             logger.exception("Failed to close SQLite connection")
+
+    @contextmanager
+    def _write_op(self):
+        with self._lock:
+            try:
+                yield self.conn
+                self.conn.commit()
+            except sqlite3.Error:
+                self.conn.rollback()
+                raise
 
     def _configure_connection(self) -> None:
         try:
@@ -182,29 +199,28 @@ class SQLiteStorage:
         started_at = self._now_iso()
         metadata_json = json.dumps(metadata) if metadata is not None else None
         try:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                """
-                INSERT OR IGNORE INTO sessions (
-                    tenant_id, content_session_id, memory_session_id, project,
-                    user_prompt, started_at, status, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    tenant_id,
-                    content_session_id,
-                    memory_session_id,
-                    project,
-                    user_prompt,
-                    started_at,
-                    "active",
-                    metadata_json,
-                ),
-            )
-            self.conn.commit()
+            with self._write_op() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO sessions (
+                        tenant_id, content_session_id, memory_session_id, project,
+                        user_prompt, started_at, status, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        tenant_id,
+                        content_session_id,
+                        memory_session_id,
+                        project,
+                        user_prompt,
+                        started_at,
+                        "active",
+                        metadata_json,
+                    ),
+                )
         except sqlite3.Error:
             logger.exception("Failed to create session")
-            self.conn.rollback()
             raise
         session = self.get_session_by_content_id(content_session_id)
         if session is None:
@@ -240,18 +256,17 @@ class SQLiteStorage:
         if ended_at is None and status_value in {"completed", "failed"}:
             ended_at = self._now_iso()
         try:
-            _ = self.conn.execute(
-                """
-                UPDATE sessions
-                SET status = ?, ended_at = ?
-                WHERE memory_session_id = ?
-                """,
-                (status_value, ended_at, memory_session_id),
-            )
-            self.conn.commit()
+            with self._write_op() as conn:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?, ended_at = ?
+                    WHERE memory_session_id = ?
+                    """,
+                    (status_value, ended_at, memory_session_id),
+                )
         except sqlite3.Error:
             logger.exception("Failed to update session status")
-            self.conn.rollback()
             raise
 
     def list_sessions(
@@ -301,26 +316,25 @@ class SQLiteStorage:
         redaction_value = self._enum_to_value(redaction_level, default="none")
         payload_text = json.dumps(payload_json) if payload_json is not None else None
         try:
-            cursor = self.conn.execute(
-                """
-                INSERT INTO session_events (
-                    memory_session_id, timestamp, kind, title, payload_json, redaction_level
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    memory_session_id,
-                    timestamp,
-                    kind_value,
-                    title,
-                    payload_text,
-                    redaction_value,
-                ),
-            )
-            self.conn.commit()
+            with self._write_op() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO session_events (
+                        memory_session_id, timestamp, kind, title, payload_json, redaction_level
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        memory_session_id,
+                        timestamp,
+                        kind_value,
+                        title,
+                        payload_text,
+                        redaction_value,
+                    ),
+                )
             return self._lastrowid(cursor, "Failed to create session event")
         except sqlite3.Error:
             logger.exception("Failed to add session event")
-            self.conn.rollback()
             raise
 
     def get_events_for_session(
@@ -361,33 +375,34 @@ class SQLiteStorage:
         timestamp = self._now_iso()
         type_value = type.value if hasattr(type, "value") else str(type)
         try:
-            cursor = self.conn.execute(
-                """
-                INSERT INTO observations (
-                    memory_session_id, timestamp, type, title, subtitle, facts_json,
-                    narrative, concepts_json, files_json, vector_ref
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    memory_session_id,
-                    timestamp,
-                    type_value,
-                    title,
-                    subtitle,
-                    json.dumps(facts_json) if facts_json is not None else None,
-                    narrative,
-                    json.dumps(list(concepts_json))
-                    if concepts_json is not None
-                    else None,
-                    json.dumps(list(files_json)) if files_json is not None else None,
-                    vector_ref,
-                ),
-            )
-            self.conn.commit()
+            with self._write_op() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO observations (
+                        memory_session_id, timestamp, type, title, subtitle, facts_json,
+                        narrative, concepts_json, files_json, vector_ref
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        memory_session_id,
+                        timestamp,
+                        type_value,
+                        title,
+                        subtitle,
+                        json.dumps(facts_json) if facts_json is not None else None,
+                        narrative,
+                        json.dumps(list(concepts_json))
+                        if concepts_json is not None
+                        else None,
+                        json.dumps(list(files_json))
+                        if files_json is not None
+                        else None,
+                        vector_ref,
+                    ),
+                )
             return self._lastrowid(cursor, "Failed to store observation")
         except sqlite3.Error:
             logger.exception("Failed to store observation")
-            self.conn.rollback()
             raise
 
     def get_observations_for_session(
@@ -462,29 +477,28 @@ class SQLiteStorage:
     ) -> int:
         timestamp = self._now_iso()
         try:
-            cursor = self.conn.execute(
-                """
-                INSERT INTO session_summaries (
-                    memory_session_id, timestamp, request, investigated,
-                    learned, completed, next_steps, vector_ref
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    memory_session_id,
-                    timestamp,
-                    request,
-                    investigated,
-                    learned,
-                    completed,
-                    next_steps,
-                    vector_ref,
-                ),
-            )
-            self.conn.commit()
+            with self._write_op() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO session_summaries (
+                        memory_session_id, timestamp, request, investigated,
+                        learned, completed, next_steps, vector_ref
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        memory_session_id,
+                        timestamp,
+                        request,
+                        investigated,
+                        learned,
+                        completed,
+                        next_steps,
+                        vector_ref,
+                    ),
+                )
             return self._lastrowid(cursor, "Failed to store session summary")
         except sqlite3.Error:
             logger.exception("Failed to store session summary")
-            self.conn.rollback()
             raise
 
     def get_summary_for_session(
@@ -535,19 +549,18 @@ class SQLiteStorage:
     ) -> int:
         timestamp = self._now_iso()
         try:
-            cursor = self.conn.execute(
-                """
-                INSERT INTO memory_links (
-                    memory_entry_id, source_kind, source_id, score, timestamp
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (memory_entry_id, source_kind, source_id, score, timestamp),
-            )
-            self.conn.commit()
+            with self._write_op() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO memory_links (
+                        memory_entry_id, source_kind, source_id, score, timestamp
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (memory_entry_id, source_kind, source_id, score, timestamp),
+                )
             return self._lastrowid(cursor, "Failed to create memory link")
         except sqlite3.Error:
             logger.exception("Failed to create memory link")
-            self.conn.rollback()
             raise
 
     def get_links_for_entry(self, memory_entry_id: str) -> list[MemoryLink]:
@@ -592,24 +605,23 @@ class SQLiteStorage:
     ) -> int:
         timestamp = self._now_iso()
         try:
-            cursor = self.conn.execute(
-                """
-                INSERT INTO consolidation_runs (
-                    tenant_id, timestamp, policy_json, stats_json
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (
-                    tenant_id,
-                    timestamp,
-                    json.dumps(policy_json) if policy_json is not None else None,
-                    json.dumps(stats_json) if stats_json is not None else None,
-                ),
-            )
-            self.conn.commit()
+            with self._write_op() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO consolidation_runs (
+                        tenant_id, timestamp, policy_json, stats_json
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        tenant_id,
+                        timestamp,
+                        json.dumps(policy_json) if policy_json is not None else None,
+                        json.dumps(stats_json) if stats_json is not None else None,
+                    ),
+                )
             return self._lastrowid(cursor, "Failed to record consolidation run")
         except sqlite3.Error:
             logger.exception("Failed to record consolidation run")
-            self.conn.rollback()
             raise
 
     def get_recent_consolidation_runs(

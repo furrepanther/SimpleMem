@@ -6,6 +6,7 @@ Implements three-layer indexing I(m_k):
 - Lexical Layer: l_k = E_sparse(m_k) - BM25 keyword matching (Tantivy FTS)
 - Symbolic Layer: r_k = E_sym(m_k) - Metadata filtering (SQL)
 """
+
 from typing import List, Optional, Dict, Any
 import lancedb
 import pyarrow as pa
@@ -30,7 +31,7 @@ class VectorStore:
         db_path: str = None,
         embedding_model: EmbeddingModel = None,
         table_name: str = None,
-        storage_options: Optional[Dict[str, Any]] = None
+        storage_options: Optional[Dict[str, Any]] = None,
     ):
         self.db_path = db_path or config.LANCEDB_PATH
         self.embedding_model = embedding_model or EmbeddingModel()
@@ -52,17 +53,21 @@ class VectorStore:
 
     def _init_table(self):
         """Initialize table schema and FTS index."""
-        schema = pa.schema([
-            pa.field("entry_id", pa.string()),
-            pa.field("lossless_restatement", pa.string()),
-            pa.field("keywords", pa.list_(pa.string())),
-            pa.field("timestamp", pa.string()),
-            pa.field("location", pa.string()),
-            pa.field("persons", pa.list_(pa.string())),
-            pa.field("entities", pa.list_(pa.string())),
-            pa.field("topic", pa.string()),
-            pa.field("vector", pa.list_(pa.float32(), self.embedding_model.dimension))
-        ])
+        schema = pa.schema(
+            [
+                pa.field("entry_id", pa.string()),
+                pa.field("lossless_restatement", pa.string()),
+                pa.field("keywords", pa.list_(pa.string())),
+                pa.field("timestamp", pa.string()),
+                pa.field("location", pa.string()),
+                pa.field("persons", pa.list_(pa.string())),
+                pa.field("entities", pa.list_(pa.string())),
+                pa.field("topic", pa.string()),
+                pa.field(
+                    "vector", pa.list_(pa.float32(), self.embedding_model.dimension)
+                ),
+            ]
+        )
 
         if self.table_name not in self.db.table_names():
             self.table = self.db.create_table(self.table_name, schema=schema)
@@ -80,9 +85,7 @@ class VectorStore:
             if self._is_cloud_storage:
                 # Use native FTS for cloud storage (Tantivy only works with local filesystem)
                 self.table.create_fts_index(
-                    "lossless_restatement",
-                    use_tantivy=False,
-                    replace=True
+                    "lossless_restatement", use_tantivy=False, replace=True
                 )
                 print("FTS index created (native mode for cloud storage)")
             else:
@@ -91,7 +94,7 @@ class VectorStore:
                     "lossless_restatement",
                     use_tantivy=True,
                     tokenizer_name="en_stem",
-                    replace=True
+                    replace=True,
                 )
                 print("FTS index created (Tantivy mode)")
             self._fts_initialized = True
@@ -103,16 +106,18 @@ class VectorStore:
         entries = []
         for r in results:
             try:
-                entries.append(MemoryEntry(
-                    entry_id=r["entry_id"],
-                    lossless_restatement=r["lossless_restatement"],
-                    keywords=list(r.get("keywords") or []),
-                    timestamp=r.get("timestamp") or None,
-                    location=r.get("location") or None,
-                    persons=list(r.get("persons") or []),
-                    entities=list(r.get("entities") or []),
-                    topic=r.get("topic") or None
-                ))
+                entries.append(
+                    MemoryEntry(
+                        entry_id=r["entry_id"],
+                        lossless_restatement=r["lossless_restatement"],
+                        keywords=list(r.get("keywords") or []),
+                        timestamp=r.get("timestamp") or None,
+                        location=r.get("location") or None,
+                        persons=list(r.get("persons") or []),
+                        entities=list(r.get("entities") or []),
+                        topic=r.get("topic") or None,
+                    )
+                )
             except Exception as e:
                 print(f"Warning: Failed to parse result: {e}")
                 continue
@@ -128,17 +133,19 @@ class VectorStore:
 
         data = []
         for entry, vector in zip(entries, vectors):
-            data.append({
-                "entry_id": entry.entry_id,
-                "lossless_restatement": entry.lossless_restatement,
-                "keywords": entry.keywords,
-                "timestamp": entry.timestamp or "",
-                "location": entry.location or "",
-                "persons": entry.persons,
-                "entities": entry.entities,
-                "topic": entry.topic or "",
-                "vector": vector.tolist()
-            })
+            data.append(
+                {
+                    "entry_id": entry.entry_id,
+                    "lossless_restatement": entry.lossless_restatement,
+                    "keywords": entry.keywords,
+                    "timestamp": entry.timestamp or "",
+                    "location": entry.location or "",
+                    "persons": entry.persons,
+                    "entities": entry.entities,
+                    "topic": entry.topic or "",
+                    "vector": vector.tolist(),
+                }
+            )
 
         self.table.add(data)
         print(f"Added {len(entries)} memory entries")
@@ -182,13 +189,22 @@ class VectorStore:
             print(f"Error during keyword search: {e}")
             return []
 
+    @staticmethod
+    def _escape_sql_value(val: str) -> str:
+        return (
+            val.replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+
     def structured_search(
         self,
         persons: Optional[List[str]] = None,
         timestamp_range: Optional[tuple] = None,
         location: Optional[str] = None,
         entities: Optional[List[str]] = None,
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
     ) -> List[MemoryEntry]:
         """
         Symbolic Layer Search - Metadata filtering (Section 3.1)
@@ -204,20 +220,24 @@ class VectorStore:
             conditions = []
 
             if persons:
-                values = ", ".join([f"'{p}'" for p in persons])
+                values = ", ".join([f"'{self._escape_sql_value(p)}'" for p in persons])
                 conditions.append(f"array_has_any(persons, make_array({values}))")
 
             if location:
-                safe_location = location.replace("'", "''")
+                safe_location = self._escape_sql_value(location)
                 conditions.append(f"location LIKE '%{safe_location}%'")
 
             if entities:
-                values = ", ".join([f"'{e}'" for e in entities])
+                values = ", ".join([f"'{self._escape_sql_value(e)}'" for e in entities])
                 conditions.append(f"array_has_any(entities, make_array({values}))")
 
             if timestamp_range:
                 start_time, end_time = timestamp_range
-                conditions.append(f"timestamp >= '{start_time}' AND timestamp <= '{end_time}'")
+                safe_start = self._escape_sql_value(str(start_time))
+                safe_end = self._escape_sql_value(str(end_time))
+                conditions.append(
+                    f"timestamp >= '{safe_start}' AND timestamp <= '{safe_end}'"
+                )
 
             where_clause = " AND ".join(conditions)
             query = self.table.search().where(where_clause, prefilter=True)

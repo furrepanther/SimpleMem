@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from ..auth.models import MemoryEntry
 from ..database.vector_store import MultiTenantVectorStore
 
-# Type alias for LLM client (supports both OpenRouter and Ollama)
-LLMClient = object  # Duck-typed: can be OpenRouterClient or OllamaClient
+# Type alias for LLM client (duck-typed OpenRouter-compatible client).
+LLMClient = object
 
 
 @dataclass
@@ -46,6 +46,9 @@ class Retriever:
         keyword_top_k: int = 5,
         enable_planning: bool = True,
         enable_reflection: bool = True,
+        enable_reranking: bool = True,
+        rerank_candidate_cap: int = 100,
+        rerank_document_max_chars: int = 1500,
         max_reflection_rounds: int = 2,
         temperature: float = 0.1,
     ):
@@ -56,14 +59,28 @@ class Retriever:
         self.keyword_top_k = keyword_top_k
         self.enable_planning = enable_planning
         self.enable_reflection = enable_reflection
+        self.enable_reranking = enable_reranking
+        self.rerank_candidate_cap = max(2, int(rerank_candidate_cap))
+        self.rerank_document_max_chars = max(256, int(rerank_document_max_chars))
         self.max_reflection_rounds = max_reflection_rounds
         self.temperature = temperature
+
+    def _truncate_rerank_document(self, text: str) -> str:
+        text = str(text or "").strip()
+        if len(text) <= self.rerank_document_max_chars:
+            return text
+        head = text[: self.rerank_document_max_chars].rstrip()
+        cut = head.rfind(" ")
+        if cut >= max(128, self.rerank_document_max_chars // 2):
+            head = head[:cut].rstrip()
+        return head
 
     async def retrieve(
         self,
         query: str,
         enable_reflection: Optional[bool] = None,
         enable_planning: Optional[bool] = None,
+        top_k: Optional[int] = None,
     ) -> List[MemoryEntry]:
         """
         Retrieve relevant memory entries for a query
@@ -87,24 +104,37 @@ class Retriever:
             else self.enable_planning
         )
 
-        if use_planning:
-            return await self._retrieve_with_planning(query, use_reflection)
-        else:
-            return await self._simple_retrieve(query)
+        semantic_top_k = self.semantic_top_k
+        if top_k is not None:
+            try:
+                semantic_top_k = max(1, int(top_k))
+            except Exception:
+                semantic_top_k = self.semantic_top_k
 
-    async def _simple_retrieve(self, query: str) -> List[MemoryEntry]:
+        if use_planning:
+            return await self._retrieve_with_planning(query, use_reflection, semantic_top_k)
+
+        results = await self._simple_retrieve(query, semantic_top_k)
+        return await self._maybe_rerank(query, results)
+
+    async def _simple_retrieve(self, query: str, semantic_top_k: int) -> List[MemoryEntry]:
         """Simple semantic search without planning"""
-        query_embedding = await self.client.create_single_embedding(query)
+        query_embedding = await self.client.create_single_embedding(
+            query,
+            task="query",
+            instruction=self._build_query_instruction(query),
+        )
         return await self.vector_store.semantic_search(
             self.table_name,
             query_embedding,
-            top_k=self.semantic_top_k,
+            top_k=semantic_top_k,
         )
 
     async def _retrieve_with_planning(
         self,
         query: str,
         enable_reflection: bool,
+        semantic_top_k: int,
     ) -> List[MemoryEntry]:
         """Retrieve with intelligent planning and optional reflection"""
 
@@ -115,7 +145,7 @@ class Retriever:
         search_queries = await self._generate_targeted_queries(query, plan)
 
         # Step 3: Execute searches sequentially
-        all_results = await self._execute_searches(search_queries)
+        all_results = await self._execute_searches(search_queries, semantic_top_k)
 
         # Step 4: Merge and deduplicate
         merged_results = self._merge_and_deduplicate(all_results)
@@ -126,9 +156,88 @@ class Retriever:
                 query,
                 merged_results,
                 plan,
+                semantic_top_k,
             )
 
-        return merged_results
+        return await self._maybe_rerank(
+            query,
+            merged_results,
+            instruction=self._build_query_instruction(query, plan.question_type),
+        )
+
+    async def _maybe_rerank(
+        self,
+        query: str,
+        results: List[MemoryEntry],
+        instruction: Optional[str] = None,
+    ) -> List[MemoryEntry]:
+        """Apply local reranking when the active client supports it."""
+        if not self.enable_reranking or len(results) < 2:
+            return results
+
+        rerank_fn = getattr(self.client, "rerank", None)
+        if not callable(rerank_fn):
+            return results
+
+        documents: list[str] = []
+        result_indexes: list[int] = []
+        for idx, entry in enumerate(results):
+            text = self._truncate_rerank_document(entry.lossless_restatement or "")
+            if not text:
+                continue
+            documents.append(text)
+            result_indexes.append(idx)
+
+        if len(documents) < 2:
+            return results
+
+        rerank_cap = min(len(documents), self.rerank_candidate_cap)
+        try:
+            ranked = await rerank_fn(
+                query=query,
+                documents=documents,
+                top_n=rerank_cap,
+                instruction=instruction or self._build_query_instruction(query),
+            )
+        except TypeError:
+            try:
+                ranked = await rerank_fn(query=query, documents=documents, top_n=rerank_cap)
+            except Exception as exc:
+                print(f"Rerank error: {exc}")
+                return results
+        except Exception as exc:
+            print(f"Rerank error: {exc}")
+            return results
+
+        if not ranked:
+            return results
+
+        ordered: list[MemoryEntry] = []
+        seen_result_indexes: set[int] = set()
+        for row in ranked:
+            if not isinstance(row, dict):
+                continue
+            row_index = row.get("index")
+            try:
+                doc_index = int(row_index)
+            except Exception:
+                continue
+            if doc_index < 0 or doc_index >= len(result_indexes):
+                continue
+            original_index = result_indexes[doc_index]
+            if original_index in seen_result_indexes:
+                continue
+            seen_result_indexes.add(original_index)
+            ordered.append(results[original_index])
+
+        if not ordered:
+            return results
+
+        for idx, entry in enumerate(results):
+            if idx not in seen_result_indexes:
+                ordered.append(entry)
+
+        return ordered
 
     async def _analyze_information_requirements(
         self,
@@ -253,17 +362,22 @@ Return ONLY valid JSON."""
     async def _execute_searches(
         self,
         queries: List[str],
+        semantic_top_k: int,
     ) -> List[List[MemoryEntry]]:
         """Execute searches sequentially"""
         all_results = []
 
         for query in queries:
             # Semantic search
-            query_embedding = await self.client.create_single_embedding(query)
+            query_embedding = await self.client.create_single_embedding(
+                query,
+                task="query",
+                instruction=self._build_query_instruction(query),
+            )
             semantic_results = await self.vector_store.semantic_search(
                 self.table_name,
                 query_embedding,
-                top_k=self.semantic_top_k,
+                top_k=semantic_top_k,
             )
             all_results.append(semantic_results)
 
@@ -331,6 +445,7 @@ Return ONLY valid JSON."""
         query: str,
         initial_results: List[MemoryEntry],
         plan: RetrievalPlan,
+        semantic_top_k: int,
     ) -> List[MemoryEntry]:
         """Iterative refinement through reflection"""
 
@@ -357,7 +472,7 @@ Return ONLY valid JSON."""
                 break
 
             # Execute additional searches
-            additional_results = await self._execute_searches(additional_queries)
+            additional_results = await self._execute_searches(additional_queries, semantic_top_k)
 
             # Merge with existing results
             all_results = [current_results] + additional_results
@@ -497,7 +612,11 @@ Return ONLY valid JSON."""
         all_results = []
 
         # Semantic search
-        query_embedding = await self.client.create_single_embedding(query)
+        query_embedding = await self.client.create_single_embedding(
+            query,
+            task="query",
+            instruction=self._build_query_instruction(query),
+        )
         semantic_results = await self.vector_store.semantic_search(
             self.table_name,
             query_embedding,
@@ -529,4 +648,53 @@ Return ONLY valid JSON."""
             # Prepend structured results (higher priority)
             all_results.insert(0, structured_results)
 
-        return self._merge_and_deduplicate(all_results)
+        merged = self._merge_and_deduplicate(all_results)
+        return await self._maybe_rerank(query, merged)
+
+    def _build_query_instruction(self, query: str, question_type: Optional[str] = None) -> str:
+        """Build a Qwen3-style query-side instruction in English."""
+        q = (query or "").strip().lower()
+        qt = (question_type or "").strip().lower()
+
+        if qt in {"temporal", "time", "temporal_reasoning"}:
+            return (
+                "Given a memory retrieval query, retrieve documents that contain the relevant event details "
+                "and absolute time information needed to answer the question."
+            )
+        if qt in {"comparative", "comparison"}:
+            return (
+                "Given a memory retrieval query, retrieve documents that support direct comparison and the "
+                "key distinguishing details."
+            )
+        if qt in {"relational", "relationship"}:
+            return (
+                "Given a memory retrieval query, retrieve documents that directly establish the relevant "
+                "relationship, association, or identity."
+            )
+        if qt in {"factual", "fact", "simple"} and q:
+            return (
+                "Given a memory retrieval query, retrieve documents that directly help answer the question. "
+                "Prefer exact facts, strong evidence, and high-signal context over tangential similarity."
+            )
+
+        if not q:
+            return "Given a memory retrieval query, retrieve relevant passages that directly help answer the query."
+        if any(token in q for token in ("when", "date", "time", "timeline", "deadline", "before", "after")):
+            return (
+                "Given a memory retrieval query, retrieve documents that contain the relevant event details "
+                "and absolute time information needed to answer the question."
+            )
+        if any(token in q for token in ("compare", "comparison", "versus", "vs", "difference", "better", "worse")):
+            return (
+                "Given a memory retrieval query, retrieve documents that support direct comparison and the "
+                "key distinguishing details."
+            )
+        if any(token in q for token in ("who", "whose", "with", "relationship", "connected", "related")):
+            return (
+                "Given a memory retrieval query, retrieve documents that directly establish the relevant "
+                "relationship, association, or identity."
+            )
+        return (
+            "Given a memory retrieval query, retrieve documents that directly help answer the question. "
+            "Prefer exact facts, strong evidence, and high-signal context over tangential similarity."
+        )

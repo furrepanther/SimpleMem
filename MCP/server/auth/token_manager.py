@@ -5,7 +5,7 @@ Token management for authentication
 import jwt
 import base64
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 from cryptography.fernet import Fernet
 
@@ -41,7 +41,7 @@ class TokenManager:
 
     def generate_token(self, user: User) -> str:
         """Generate a JWT token for a user"""
-        expiration = datetime.utcnow() + timedelta(days=self.expiration_days)
+        expiration = datetime.now(timezone.utc) + timedelta(days=self.expiration_days)
 
         payload = TokenPayload(
             user_id=user.user_id,
@@ -56,7 +56,9 @@ class TokenManager:
             algorithm=self.algorithm,
         )
 
-    def verify_token(self, token: str) -> Tuple[bool, Optional[TokenPayload], Optional[str]]:
+    def verify_token(
+        self, token: str
+    ) -> Tuple[bool, Optional[TokenPayload], Optional[str]]:
         """
         Verify a JWT token
 
@@ -89,7 +91,7 @@ class TokenManager:
             return None, error
 
         # Create new token with same user info but new expiration
-        expiration = datetime.utcnow() + timedelta(days=self.expiration_days)
+        expiration = datetime.now(timezone.utc) + timedelta(days=self.expiration_days)
 
         new_payload = TokenPayload(
             user_id=payload.user_id,

@@ -20,13 +20,15 @@ class OpenRouterClient:
         base_url: str = "https://openrouter.ai/api/v1",
         embedding_base_url: Optional[str] = None,
         llm_model: str = "openai/gpt-4.1-mini",
-        embedding_model: str = "qwen/qwen3-embedding-4b",
+        embedding_model: str = "BAAI/bge-m3",
+        reranker_model: str = "BAAI/bge-reranker-v2-m3",
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.embedding_base_url = (embedding_base_url or base_url).rstrip("/")
         self.llm_model = llm_model
         self.embedding_model = embedding_model
+        self.reranker_model = reranker_model
 
         # Lazy import to avoid issues if not installed
         self._chat_client = None
@@ -53,6 +55,7 @@ class OpenRouterClient:
         """Get or create the chat HTTP client."""
         if self._chat_client is None:
             import httpx
+
             self._chat_client = httpx.AsyncClient(
                 base_url=self.base_url,
                 headers=self._build_headers(),
@@ -64,6 +67,7 @@ class OpenRouterClient:
         """Get or create the embedding HTTP client."""
         if self._embed_client is None:
             import httpx
+
             self._embed_client = httpx.AsyncClient(
                 base_url=self.embedding_base_url,
                 headers=self._build_headers(),
@@ -151,6 +155,9 @@ class OpenRouterClient:
     async def create_embedding(
         self,
         texts: List[str],
+        *,
+        task: Optional[str] = None,
+        instruction: Optional[str] = None,
     ) -> List[List[float]]:
         """
         Create embeddings for texts
@@ -167,6 +174,10 @@ class OpenRouterClient:
             "model": self.embedding_model,
             "input": texts,
         }
+        if task and self._is_local_base_url(self.embedding_base_url):
+            payload["task"] = task
+        if instruction and self._is_local_base_url(self.embedding_base_url):
+            payload["instruction"] = instruction
 
         response = await client.post("/embeddings", json=payload)
         response.raise_for_status()
@@ -176,10 +187,54 @@ class OpenRouterClient:
         embeddings_data = sorted(data["data"], key=lambda x: x["index"])
         return [item["embedding"] for item in embeddings_data]
 
-    async def create_single_embedding(self, text: str) -> List[float]:
+    async def create_single_embedding(
+        self,
+        text: str,
+        *,
+        task: Optional[str] = None,
+        instruction: Optional[str] = None,
+    ) -> List[float]:
         """Create embedding for a single text"""
-        embeddings = await self.create_embedding([text])
+        embeddings = await self.create_embedding(
+            [text], task=task, instruction=instruction
+        )
         return embeddings[0]
+
+    async def rerank(
+        self,
+        query: str,
+        documents: List[str],
+        top_n: Optional[int] = None,
+        instruction: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Rerank documents for a query using the local reranker endpoint.
+        """
+        if not documents:
+            return []
+
+        client = self._get_embed_client()
+        payload: Dict[str, Any] = {
+            "model": self.reranker_model,
+            "query": query,
+            "documents": documents,
+        }
+        if top_n is not None:
+            payload["top_n"] = max(1, int(top_n))
+        if instruction and self._is_local_base_url(self.embedding_base_url):
+            payload["instruction"] = instruction
+
+        response = await client.post("/rerank", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        results = data.get("results", data.get("data", []))
+        if not isinstance(results, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for row in results:
+            if isinstance(row, dict):
+                out.append(row)
+        return out
 
     async def verify_api_key(self) -> tuple[bool, Optional[str]]:
         """
@@ -201,7 +256,10 @@ class OpenRouterClient:
 
         # Cloud mode: enforce OpenRouter key semantics.
         if not self.api_key or not self.api_key.startswith("sk-or-"):
-            return False, "Invalid key format. OpenRouter API keys start with 'sk-or-'. Get yours at openrouter.ai/keys"
+            return (
+                False,
+                "Invalid key format. OpenRouter API keys start with 'sk-or-'. Get yours at openrouter.ai/keys",
+            )
 
         try:
             client = self._get_chat_client()
@@ -290,7 +348,9 @@ class OpenRouterClient:
 
         return None
 
-    def _extract_balanced_braces(self, text: str, open_char: str, close_char: str) -> Optional[str]:
+    def _extract_balanced_braces(
+        self, text: str, open_char: str, close_char: str
+    ) -> Optional[str]:
         """Extract a balanced brace-enclosed string"""
         if not text or text[0] != open_char:
             return None
@@ -337,7 +397,7 @@ class OpenRouterClient:
         cleaned = text.strip()
         for prefix in prefixes:
             if cleaned.lower().startswith(prefix.lower()):
-                cleaned = cleaned[len(prefix):].strip()
+                cleaned = cleaned[len(prefix) :].strip()
 
         # Remove trailing commas before } or ]
         cleaned = re.sub(r",\s*([\}\]])", r"\1", cleaned)
@@ -351,44 +411,60 @@ class OpenRouterClient:
 class OpenRouterClientManager:
     """
     Manages OpenRouter client instances for multiple users.
-    Provides client pooling and lifecycle management.
+    Provides client pooling and lifecycle management with LRU eviction.
     """
+
+    _MAX_CACHED_CLIENTS = 128
 
     def __init__(
         self,
         base_url: str = "https://openrouter.ai/api/v1",
         embedding_base_url: Optional[str] = None,
         llm_model: str = "openai/gpt-4.1-mini",
-        embedding_model: str = "qwen/qwen3-embedding-4b",
+        embedding_model: str = "BAAI/bge-m3",
+        reranker_model: str = "BAAI/bge-reranker-v2-m3",
     ):
         self.base_url = base_url
         self.embedding_base_url = embedding_base_url or base_url
         self.llm_model = llm_model
         self.embedding_model = embedding_model
+        self.reranker_model = reranker_model
         self._clients: Dict[str, OpenRouterClient] = {}
+        self._client_order: List[str] = []
+
+    def _evict_oldest(self) -> None:
+        import asyncio
+
+        while len(self._clients) > self._MAX_CACHED_CLIENTS and self._client_order:
+            oldest_key = self._client_order.pop(0)
+            client = self._clients.pop(oldest_key, None)
+            if client is not None:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(client.close())
+                except RuntimeError:
+                    pass
 
     def get_client(self, api_key: str) -> OpenRouterClient:
-        """
-        Get or create an OpenRouter client for the given API key
-
-        Args:
-            api_key: User's OpenRouter API key
-
-        Returns:
-            OpenRouterClient instance
-        """
-        # Use hash of API key as cache key for security
         import hashlib
+
         key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
-        if key_hash not in self._clients:
-            self._clients[key_hash] = OpenRouterClient(
-                api_key=api_key,
-                base_url=self.base_url,
-                embedding_base_url=self.embedding_base_url,
-                llm_model=self.llm_model,
-                embedding_model=self.embedding_model,
-            )
+        if key_hash in self._clients:
+            self._client_order.remove(key_hash)
+            self._client_order.append(key_hash)
+            return self._clients[key_hash]
+
+        self._clients[key_hash] = OpenRouterClient(
+            api_key=api_key,
+            base_url=self.base_url,
+            embedding_base_url=self.embedding_base_url,
+            llm_model=self.llm_model,
+            embedding_model=self.embedding_model,
+            reranker_model=self.reranker_model,
+        )
+        self._client_order.append(key_hash)
+        self._evict_oldest()
 
         return self._clients[key_hash]
 
@@ -397,12 +473,15 @@ class OpenRouterClientManager:
         for client in self._clients.values():
             await client.close()
         self._clients.clear()
+        self._client_order.clear()
 
     async def remove_client(self, api_key: str):
         """Remove and close a specific client"""
         import hashlib
+
         key_hash = hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
         if key_hash in self._clients:
             await self._clients[key_hash].close()
             del self._clients[key_hash]
+            self._client_order.remove(key_hash)

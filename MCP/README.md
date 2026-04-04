@@ -46,7 +46,7 @@ SimpleMem MCP Server is a cloud-hosted long-term memory service for LLM agents, 
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │               OpenRouter API Integration                  │  │
-│  │  LLM: openai/gpt-4.1-mini    Embed: qwen/qwen3-embed-4b  │  │
+│  │  LLM: openai/gpt-4.1-mini    Embed: BAAI/bge-m3                │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -139,7 +139,8 @@ Mcp-Session-Id: <session-id>
 
 | Tool | Description |
 |------|-------------|
-| `memory_add` | Add a single dialogue to memory (auto-extracts facts, resolves pronouns, anchors timestamps) |
+| `memory_store` | Canonical exact raw durable write entrypoint for one memory entry |
+| `memory_add` | Legacy compatibility alias for dialogue/extraction-style writes |
 | `memory_add_batch` | Add multiple dialogues at once |
 | `memory_query` | Query memories and generate AI-synthesized answers (with planning + hybrid retrieval + reflection) |
 | `memory_retrieve` | Retrieve relevant memory entries (returns raw data) |
@@ -193,7 +194,7 @@ Dialogue Input                  Processing                     Memory Storage
                                                           ▼
                                               ┌─────────────────────────┐
                                               │      Embedding          │
-                                              │   (qwen3-embed-4b)      │
+                                              │   (BAAI/bge-m3)                    │
                                               └───────────┬─────────────┘
                                                           │
                                                           ▼
@@ -259,7 +260,7 @@ User Question: "When am I meeting Bob?"
 | `enable_reflection` | true | Enable reflection iteration |
 | `max_reflection_rounds` | 2 | Maximum reflection rounds |
 | `llm_model` | openai/gpt-4.1-mini | LLM model |
-| `embedding_model` | qwen/qwen3-embedding-4b | Embedding model |
+| `embedding_model` | BAAI/bge-m3 | Embedding model |
 
 ## Development
 

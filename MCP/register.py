@@ -15,7 +15,7 @@ def register():
     print("=" * 60)
     print()
 
-    # For local Ollama mode, accept env override and use non-secret local marker by default.
+    # For local OpenRouter-compatible endpoints, accept env override and use a non-secret marker by default.
     api_key = os.getenv("OPENROUTER_API_KEY") or "local-mode"
 
     print(f"Registering with API key: {api_key}")

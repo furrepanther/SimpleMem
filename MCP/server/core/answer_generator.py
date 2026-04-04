@@ -8,8 +8,8 @@ from typing import List, Optional
 
 from ..auth.models import MemoryEntry
 
-# Type alias for LLM client (supports both OpenRouter and Ollama)
-LLMClient = object  # Duck-typed: can be OpenRouterClient or OllamaClient
+# Type alias for LLM client (duck-typed OpenRouter-compatible client).
+LLMClient = object  # Duck-typed: OpenRouter-compatible client
 
 
 class AnswerGenerator:
@@ -24,12 +24,14 @@ class AnswerGenerator:
         max_context_entries: int = 10,
         max_context_entry_chars: int = 320,
         max_context_total_chars: int = 3500,
+        max_answer_tokens: int = 64,
     ):
         self.client = llm_client
         self.temperature = temperature
         self.max_context_entries = max(1, int(max_context_entries))
         self.max_context_entry_chars = max(80, int(max_context_entry_chars))
         self.max_context_total_chars = max(self.max_context_entry_chars, int(max_context_total_chars))
+        self.max_answer_tokens = max(24, int(max_answer_tokens))
 
     async def generate_answer(
         self,
@@ -63,9 +65,10 @@ class AnswerGenerator:
             {
                 "role": "system",
                 "content": (
-                    "You are a helpful assistant that answers questions based on provided context. "
-                    "Always base your answers on the given context. "
-                    "If the context doesn't contain enough information, say so."
+                    "Answer only from the provided context. "
+                    "Return minified JSON with keys answer and confidence. "
+                    "If the context is insufficient, answer exactly "
+                    '{"answer":"insufficient context","confidence":"low"}.'
                 ),
             },
             {"role": "user", "content": prompt},
@@ -78,6 +81,7 @@ class AnswerGenerator:
                 response = await self.client.chat_completion(
                     messages=messages,
                     temperature=self.temperature,
+                    max_tokens=self.max_answer_tokens,
                     response_format={"type": "json_object"},
                 )
 
@@ -120,20 +124,20 @@ class AnswerGenerator:
 
             metadata = []
             if entry.timestamp:
-                metadata.append(f"Time: {entry.timestamp}")
+                metadata.append(f"t={entry.timestamp}")
             if entry.location:
-                metadata.append(f"Location: {entry.location}")
+                metadata.append(f"loc={entry.location}")
             if entry.persons:
-                metadata.append(f"Persons: {', '.join(entry.persons)}")
+                metadata.append(f"p={','.join(entry.persons)}")
             if entry.entities:
-                metadata.append(f"Entities: {', '.join(entry.entities)}")
+                metadata.append(f"e={','.join(entry.entities)}")
             if entry.topic:
-                metadata.append(f"Topic: {entry.topic}")
+                metadata.append(f"topic={entry.topic}")
 
             if metadata:
-                parts.append(f"   ({'; '.join(metadata)})")
+                parts.append(f" ({'; '.join(metadata)})")
 
-            block = "\n".join(parts)
+            block = "".join(parts)
             if total_chars + len(block) > self.max_context_total_chars:
                 remaining = self.max_context_total_chars - total_chars
                 if remaining > 120:
@@ -147,34 +151,11 @@ class AnswerGenerator:
 
     def _build_answer_prompt(self, query: str, context_str: str) -> str:
         """Build the answer generation prompt"""
-        return f"""Answer the user's question based on the provided context.
-
-## User Question:
-{query}
-
-## Relevant Context:
-{context_str}
-
-## Requirements:
-1. Think through the reasoning process step by step
-2. Base your answer ONLY on the provided context
-3. Provide a CONCISE answer (short phrase or 1-2 sentences)
-4. Format dates as 'DD Month YYYY' (e.g., "15 January 2025")
-5. If context is insufficient, clearly state that
-
-## Confidence Levels:
-- "high": Context directly answers the question
-- "medium": Context provides partial or indirect information
-- "low": Context is insufficient or answer requires inference
-
-## Output Format (JSON only):
-{{
-  "reasoning": "Brief explanation of how you derived the answer",
-  "answer": "Concise answer to the question",
-  "confidence": "high/medium/low"
-}}
-
-Return ONLY valid JSON. No other text."""
+        return (
+            f"Q:{query}\n"
+            f"CTX:\n{context_str}\n"
+            'Return only minified JSON {"answer":"...","confidence":"high|medium|low"}.'
+        )
 
     async def generate_summary(
         self,

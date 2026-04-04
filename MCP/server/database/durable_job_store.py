@@ -13,8 +13,8 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 
 class DurableJobStore:
@@ -23,6 +23,7 @@ class DurableJobStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._init_lock = threading.Lock()
+        self._local = threading.local()
         parent = os.path.dirname(db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -30,23 +31,45 @@ class DurableJobStore:
 
     @staticmethod
     def _utc_now() -> datetime:
-        return datetime.utcnow()
+        return datetime.now(timezone.utc)
 
     @staticmethod
     def _utc_now_iso() -> str:
         return DurableJobStore._utc_now().isoformat()
 
-    @contextmanager
-    def _connection(self):
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+                return conn
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
         conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=FULL")
-            conn.execute("PRAGMA busy_timeout=30000")
-            yield conn
-        finally:
-            conn.close()
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        self._local.conn = conn
+        return conn
+
+    def close(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
+
+    @contextmanager
+    def _connection(self):
+        conn = self._get_connection()
+        yield conn
 
     def _init_db(self) -> None:
         with self._init_lock:
@@ -203,7 +226,9 @@ class DurableJobStore:
     ) -> list[dict[str, Any]]:
         now = self._utc_now()
         now_iso = now.isoformat()
-        lease_expires_iso = (now + timedelta(seconds=max(5, int(lease_seconds)))).isoformat()
+        lease_expires_iso = (
+            now + timedelta(seconds=max(5, int(lease_seconds)))
+        ).isoformat()
         take = max(1, int(batch_size))
 
         with self._connection() as conn:
@@ -268,19 +293,25 @@ class DurableJobStore:
         now_iso = self._utc_now_iso()
         result_json = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         with self._connection() as conn:
-            conn.execute(
-                """
-                UPDATE durable_jobs
-                SET status = 'done',
-                    lease_owner = NULL,
-                    lease_expires_at_utc = NULL,
-                    last_error = NULL,
-                    result_json = ?,
-                    updated_at_utc = ?
-                WHERE job_id = ?
-                """,
-                (result_json, now_iso, job_id),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    UPDATE durable_jobs
+                    SET status = 'done',
+                        lease_owner = NULL,
+                        lease_expires_at_utc = NULL,
+                        last_error = NULL,
+                        result_json = ?,
+                        updated_at_utc = ?
+                    WHERE job_id = ?
+                    """,
+                    (result_json, now_iso, job_id),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def mark_failed(
         self,
@@ -307,10 +338,14 @@ class DurableJobStore:
 
                 if retryable and attempt_count < max(1, int(max_retries)):
                     exp = max(1, attempt_count - 1)
-                    delay_ms = int(max(100, int(backoff_base_ms)) * (2 ** exp))
+                    delay_ms = int(max(100, int(backoff_base_ms)) * (2**exp))
                     # jitter in-process based on time + hash without random module dependency
-                    jitter = (abs(hash(f"{job_id}:{attempt_count}:{time.time_ns()}")) % 200)
-                    retry_at = (now + timedelta(milliseconds=delay_ms + jitter)).isoformat()
+                    jitter = (
+                        abs(hash(f"{job_id}:{attempt_count}:{time.time_ns()}")) % 200
+                    )
+                    retry_at = (
+                        now + timedelta(milliseconds=delay_ms + jitter)
+                    ).isoformat()
                     conn.execute(
                         """
                         UPDATE durable_jobs
@@ -326,7 +361,11 @@ class DurableJobStore:
                         (attempt_count, retry_at, error[:5000], now_iso, job_id),
                     )
                     conn.execute("COMMIT")
-                    return {"status": "failed_retryable", "attempt_count": attempt_count, "retry_at_utc": retry_at}
+                    return {
+                        "status": "failed_retryable",
+                        "attempt_count": attempt_count,
+                        "retry_at_utc": retry_at,
+                    }
 
                 conn.execute(
                     """
@@ -401,15 +440,42 @@ class DurableJobStore:
             )
             return int(cur.rowcount or 0)
 
-    def queue_counts(self) -> dict[str, Any]:
+    def queue_counts(self, user_id: Optional[str] = None) -> dict[str, Any]:
         with self._connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT status, COUNT(*) AS c
-                FROM durable_jobs
-                GROUP BY status
-                """
-            ).fetchall()
+            if user_id:
+                rows = conn.execute(
+                    """
+                    SELECT status, COUNT(*) AS c
+                    FROM durable_jobs
+                    WHERE user_id = ?
+                    GROUP BY status
+                    """,
+                    (user_id,),
+                ).fetchall()
+                oldest = conn.execute(
+                    """
+                    SELECT MIN(created_at_utc) AS oldest
+                    FROM durable_jobs
+                    WHERE status IN ('pending', 'failed_retryable', 'processing')
+                      AND user_id = ?
+                    """,
+                    (user_id,),
+                ).fetchone()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT status, COUNT(*) AS c
+                    FROM durable_jobs
+                    GROUP BY status
+                    """
+                ).fetchall()
+                oldest = conn.execute(
+                    """
+                    SELECT MIN(created_at_utc) AS oldest
+                    FROM durable_jobs
+                    WHERE status IN ('pending', 'failed_retryable', 'processing')
+                    """
+                ).fetchone()
             counts = {str(r["status"]): int(r["c"]) for r in rows}
             oldest = conn.execute(
                 """
@@ -422,7 +488,9 @@ class DurableJobStore:
             if oldest and oldest["oldest"]:
                 try:
                     created = datetime.fromisoformat(str(oldest["oldest"]))
-                    oldest_pending_age_s = max(0.0, (self._utc_now() - created).total_seconds())
+                    oldest_pending_age_s = max(
+                        0.0, (self._utc_now() - created).total_seconds()
+                    )
                 except Exception:
                     oldest_pending_age_s = 0.0
             return {
@@ -433,3 +501,18 @@ class DurableJobStore:
                 "failed_terminal": counts.get("failed_terminal", 0),
                 "oldest_pending_age_s": round(oldest_pending_age_s, 3),
             }
+
+    def purge_completed_jobs(self, max_age_hours: int = 24) -> int:
+        cutoff = (self._utc_now() - timedelta(hours=max_age_hours)).isoformat()
+        with self._connection() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM durable_jobs
+                WHERE status IN ('done', 'failed_terminal')
+                  AND updated_at_utc IS NOT NULL
+                  AND updated_at_utc < ?
+                """,
+                (cutoff,),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)

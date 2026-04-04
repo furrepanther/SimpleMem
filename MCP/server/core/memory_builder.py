@@ -10,14 +10,14 @@ Simplified: Direct processing without buffering.
 """
 
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 from ..auth.models import MemoryEntry, Dialogue
 from ..database.vector_store import MultiTenantVectorStore
 
-# Type alias for LLM client (supports both OpenRouter and Ollama)
-LLMClient = object  # Duck-typed: can be OpenRouterClient or OllamaClient
+# Type alias for LLM client (duck-typed OpenRouter-compatible client).
+LLMClient = object  # Duck-typed: OpenRouter-compatible client
 
 
 class MemoryBuilder:
@@ -71,7 +71,7 @@ class MemoryBuilder:
             dialogue_id=self._total_processed + 1,
             speaker=speaker,
             content=content,
-            timestamp=timestamp or datetime.utcnow().isoformat(),
+            timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
         )
 
         # Process immediately
@@ -131,18 +131,21 @@ class MemoryBuilder:
         # Convert to Dialogue objects
         dialogue_objects = []
         for i, dlg in enumerate(dialogues):
-            dialogue_objects.append(Dialogue(
-                dialogue_id=self._total_processed + i + 1,
-                speaker=dlg.get("speaker", ""),
-                content=dlg.get("content", ""),
-                timestamp=dlg.get("timestamp") or datetime.utcnow().isoformat(),
-            ))
+            dialogue_objects.append(
+                Dialogue(
+                    dialogue_id=self._total_processed + i + 1,
+                    speaker=dlg.get("speaker", ""),
+                    content=dlg.get("content", ""),
+                    timestamp=dlg.get("timestamp")
+                    or datetime.now(timezone.utc).isoformat(),
+                )
+            )
 
         total_entries = 0
 
         # Process in windows if too many dialogues
         for i in range(0, len(dialogue_objects), self.window_size):
-            window = dialogue_objects[i:i + self.window_size]
+            window = dialogue_objects[i : i + self.window_size]
 
             entries = await self._generate_memory_entries(window)
 
@@ -218,7 +221,9 @@ class MemoryBuilder:
                     continue
 
                 # Handle both list and dict with "entries" key
-                entries_data = data if isinstance(data, list) else data.get("entries", [])
+                entries_data = (
+                    data if isinstance(data, list) else data.get("entries", [])
+                )
 
                 entries = []
                 for item in entries_data:

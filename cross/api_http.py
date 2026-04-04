@@ -26,11 +26,48 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, FastAPI, HTTPException
+import jwt
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+
+_auth_secret_key: Optional[str] = None
+_auth_algorithm: str = "HS256"
+
+
+def _set_auth_config(secret_key: Optional[str], algorithm: str = "HS256") -> None:
+    global _auth_secret_key, _auth_algorithm
+    _auth_secret_key = secret_key
+    _auth_algorithm = algorithm
+
+
+async def _verify_cross_auth(request: Request) -> None:
+    if not _auth_secret_key:
+        return
+    authorization = request.headers.get("Authorization")
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Authorization header format. Use: Bearer <token>",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = parts[1]
+    try:
+        jwt.decode(token, _auth_secret_key, algorithms=[_auth_algorithm])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -195,13 +232,13 @@ def create_cross_router(orchestrator: Any) -> APIRouter:
     """
 
     router = APIRouter(tags=["cross"])
-
-    # ----- session lifecycle ------------------------------------------------
+    auth_dep = Depends(_verify_cross_auth)
 
     @router.post(
         "/sessions/start",
         response_model=StartSessionResponse,
         summary="Start a new memory session",
+        dependencies=[auth_dep],
     )
     async def start_session(req: StartSessionRequest) -> StartSessionResponse:
         """Create a new cross-session memory session and optionally inject
@@ -248,6 +285,7 @@ def create_cross_router(orchestrator: Any) -> APIRouter:
         "/sessions/{memory_session_id}/message",
         response_model=EventIdResponse,
         summary="Record a chat message event",
+        dependencies=[auth_dep],
     )
     async def record_message(
         memory_session_id: str,
@@ -271,6 +309,7 @@ def create_cross_router(orchestrator: Any) -> APIRouter:
         "/sessions/{memory_session_id}/tool-use",
         response_model=EventIdResponse,
         summary="Record a tool invocation event",
+        dependencies=[auth_dep],
     )
     async def record_tool_use(
         memory_session_id: str,
@@ -297,6 +336,7 @@ def create_cross_router(orchestrator: Any) -> APIRouter:
         "/sessions/{memory_session_id}/stop",
         response_model=StopSessionResponse,
         summary="Finalize (stop) a memory session",
+        dependencies=[auth_dep],
     )
     async def stop_session(memory_session_id: str) -> StopSessionResponse:
         """Finalize a session: flush events, extract observations, generate
@@ -333,6 +373,7 @@ def create_cross_router(orchestrator: Any) -> APIRouter:
     @router.post(
         "/sessions/{memory_session_id}/end",
         summary="Mark a session as completed",
+        dependencies=[auth_dep],
     )
     async def end_session(memory_session_id: str) -> Dict[str, Any]:
         """Mark the session as completed (or failed) in the backing store.
@@ -355,6 +396,7 @@ def create_cross_router(orchestrator: Any) -> APIRouter:
         "/search",
         response_model=SearchResponse,
         summary="Semantic search across stored memory",
+        dependencies=[auth_dep],
     )
     async def search(req: SearchRequest) -> SearchResponse:
         """Run a semantic search against the cross-session memory store."""
@@ -410,6 +452,7 @@ def create_cross_router(orchestrator: Any) -> APIRouter:
         "/stats",
         response_model=StatsResponse,
         summary="Get aggregate memory statistics",
+        dependencies=[auth_dep],
     )
     async def get_stats() -> StatsResponse:
         """Return aggregate counts of sessions, events, observations, and
@@ -474,6 +517,8 @@ def create_app(
     *,
     orchestrator: Any = None,
     cors_origins: Optional[List[str]] = None,
+    auth_secret_key: Optional[str] = None,
+    auth_algorithm: str = "HS256",
     **kwargs: Any,
 ) -> FastAPI:
     """Create a complete FastAPI application with the cross-session router.
@@ -492,6 +537,11 @@ def create_app(
         is only used for metadata.
     cors_origins:
         Allowed CORS origins.  Defaults to ``["*"]`` (allow all).
+    auth_secret_key:
+        JWT secret key for Bearer token authentication.  When provided,
+        all endpoints except ``/cross/health`` require a valid token.
+    auth_algorithm:
+        JWT algorithm (default ``HS256``).
     **kwargs:
         Additional keyword arguments forwarded to ``FastAPI()``.
 
@@ -503,6 +553,7 @@ def create_app(
 
     global _startup_time
     _startup_time = time.monotonic()
+    _set_auth_config(auth_secret_key, auth_algorithm)
 
     app = FastAPI(
         title="SimpleMem-Cross API",

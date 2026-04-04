@@ -19,8 +19,9 @@ import json
 import os
 import uuid
 import secrets
+import time
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
@@ -35,15 +36,16 @@ from .auth.models import User
 from .database.user_store import UserStore
 from .database.vector_store import MultiTenantVectorStore
 from .integrations.openrouter import OpenRouterClient, OpenRouterClientManager
-from .integrations.ollama import OllamaClient, OllamaClientManager
 from .mcp_handler import MCPHandler
 
 import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import get_settings
 
 
 # === Pydantic Models ===
+
 
 class RegisterRequest(BaseModel):
     openrouter_api_key: str
@@ -60,9 +62,11 @@ class RegisterResponse(BaseModel):
 
 # === Session Management ===
 
+
 @dataclass
 class MCPSession:
     """Represents an active MCP session"""
+
     session_id: str
     user_id: str
     user: User
@@ -85,7 +89,7 @@ class MCPSession:
 
     def touch(self):
         """Update last active timestamp"""
-        self.last_active = datetime.utcnow()
+        self.last_active = datetime.now(timezone.utc)
 
 
 # Session expiry time (30 minutes of inactivity)
@@ -96,28 +100,23 @@ SESSION_EXPIRY_MINUTES = 30
 
 settings = get_settings()
 user_store = UserStore(settings.user_db_path)
-vector_store = MultiTenantVectorStore(settings.lancedb_path, settings.embedding_dimension)
+vector_store = MultiTenantVectorStore(
+    settings.lancedb_path, settings.embedding_dimension
+)
 token_manager = TokenManager(
     secret_key=settings.jwt_secret_key,
     encryption_key=settings.encryption_key,
     expiration_days=settings.jwt_expiration_days,
 )
 
-# Initialize client manager based on provider
-if settings.llm_provider == "ollama":
-    client_manager = OllamaClientManager(
-        base_url=settings.ollama_base_url,
-        embedding_base_url=settings.ollama_embedding_base_url,
-        llm_model=settings.llm_model,
-        embedding_model=settings.embedding_model,
-    )
-else:  # Default to OpenRouter
-    client_manager = OpenRouterClientManager(
-        base_url=settings.openrouter_base_url,
-        embedding_base_url=settings.openrouter_embedding_base_url,
-        llm_model=settings.llm_model,
-        embedding_model=settings.embedding_model,
-    )
+# Initialize client manager against the active OpenRouter-compatible endpoints.
+client_manager = OpenRouterClientManager(
+    base_url=settings.openrouter_base_url,
+    embedding_base_url=settings.openrouter_embedding_base_url,
+    llm_model=settings.llm_model,
+    embedding_model=settings.embedding_model,
+    reranker_model=settings.reranker_model,
+)
 
 # Store active MCP handlers per user (legacy)
 _mcp_handlers: dict[str, MCPHandler] = {}
@@ -128,15 +127,25 @@ _sessions: dict[str, MCPSession] = {}
 # Lock for session operations
 _session_lock = asyncio.Lock()
 
+# Throttle user activity writes to avoid sync-write amplification on MCP hot paths.
+LAST_ACTIVE_UPDATE_INTERVAL_S = max(
+    0,
+    int(os.getenv("SIMPLEMEM_LAST_ACTIVE_UPDATE_INTERVAL_S", "300")),
+)
+_last_active_write_ts: dict[str, float] = {}
+_last_active_lock = asyncio.Lock()
+
 
 # === Session Helper Functions ===
+
 
 async def cleanup_expired_sessions():
     """Remove expired sessions"""
     async with _session_lock:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expired = [
-            sid for sid, session in _sessions.items()
+            sid
+            for sid, session in _sessions.items()
             if (now - session.last_active).total_seconds() > SESSION_EXPIRY_MINUTES * 60
         ]
         for sid in expired:
@@ -157,7 +166,9 @@ def generate_session_id() -> str:
     return secrets.token_urlsafe(32)
 
 
-async def get_or_create_session(user: User, api_key: str, session_id: Optional[str] = None) -> MCPSession:
+async def get_or_create_session(
+    user: User, api_key: str, session_id: Optional[str] = None
+) -> MCPSession:
     """Get existing session or create new one"""
     async with _session_lock:
         if session_id and session_id in _sessions:
@@ -205,6 +216,7 @@ async def delete_session(session_id: str) -> bool:
 
 # === Authentication Helper ===
 
+
 async def verify_bearer_token(authorization: Optional[str]) -> tuple[User, str]:
     """
     Verify Bearer token from Authorization header.
@@ -235,7 +247,7 @@ async def verify_bearer_token(authorization: Optional[str]) -> tuple[User, str]:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    user = user_store.get_user(payload.user_id)
+    user = await asyncio.to_thread(user_store.get_user, payload.user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -243,7 +255,27 @@ async def verify_bearer_token(authorization: Optional[str]) -> tuple[User, str]:
     return user, api_key
 
 
+async def maybe_update_last_active(user_id: str) -> None:
+    """Rate-limit last_active writes to reduce hot-path DB overhead."""
+    if LAST_ACTIVE_UPDATE_INTERVAL_S <= 0:
+        return
+    now = time.monotonic()
+    should_write = False
+    async with _last_active_lock:
+        last = _last_active_write_ts.get(user_id, 0.0)
+        if (now - last) >= float(LAST_ACTIVE_UPDATE_INTERVAL_S):
+            _last_active_write_ts[user_id] = now
+            should_write = True
+    if should_write:
+        try:
+            await asyncio.to_thread(user_store.update_last_active, user_id)
+        except Exception:
+            # Keep MCP request path resilient even if activity update fails.
+            pass
+
+
 # === Lifecycle ===
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -251,12 +283,15 @@ async def lifespan(app: FastAPI):
     print("SimpleMem MCP Server started")
     print(f"  - LLM Model: {settings.llm_model}")
     print(f"  - Embedding Model: {settings.embedding_model}")
+    print(f"  - Reranker Model: {settings.reranker_model}")
     print(f"  - Window Size: {settings.window_size}")
     print(f"  - Transport: Streamable HTTP (2025-03-26)")
     await MCPHandler.start_background_workers(
         settings=settings,
         vector_store=vector_store,
         client_manager=client_manager,
+        user_store=user_store,
+        token_manager=token_manager,
     )
 
     # Start session cleanup task
@@ -286,7 +321,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -295,43 +330,32 @@ app.add_middleware(
 
 # === Authentication Endpoints ===
 
+
 @app.post("/api/auth/register", response_model=RegisterResponse)
 async def register(request: RegisterRequest):
-    """Register a new user with API key (or placeholder for Ollama)"""
+    """Register a new user with API key (local endpoints may ignore it)."""
     try:
         api_key = request.openrouter_api_key
         requested_user_id = (request.user_id or "").strip()
 
-        # For Ollama, we don't need a real API key, use a placeholder
-        if settings.llm_provider == "ollama":
-            if not api_key or api_key == "":
-                # Local Ollama mode does not require a remote provider key.
-                api_key = os.getenv("OPENROUTER_API_KEY") or "local-mode"
+        # Validate the active OpenRouter-compatible endpoint. Local endpoints
+        # only require reachability; cloud endpoints still require a valid key.
+        client = OpenRouterClient(
+            api_key=api_key,
+            base_url=settings.openrouter_base_url,
+            embedding_base_url=settings.openrouter_embedding_base_url,
+            llm_model=settings.llm_model,
+            embedding_model=settings.embedding_model,
+            reranker_model=settings.reranker_model,
+        )
+        is_valid, error = await client.verify_api_key()
+        await client.close()
 
-            # Verify Ollama is accessible
-            client = OllamaClient(base_url=settings.ollama_base_url)
-            is_valid, error = await client.verify_api_key()
-            await client.close()
-
-            if not is_valid:
-                return RegisterResponse(
-                    success=False,
-                    error=f"Cannot connect to Ollama: {error}",
-                )
-        else:
-            # For OpenRouter, validate the API key
-            client = OpenRouterClient(
-                api_key=api_key,
-                base_url=settings.openrouter_base_url,
+        if not is_valid:
+            return RegisterResponse(
+                success=False,
+                error=f"Invalid OpenRouter-compatible endpoint or API key: {error}",
             )
-            is_valid, error = await client.verify_api_key()
-            await client.close()
-
-            if not is_valid:
-                return RegisterResponse(
-                    success=False,
-                    error=f"Invalid OpenRouter API key: {error}",
-                )
 
         # Resolve target user:
         # - when user_id is provided, upsert that specific user
@@ -343,7 +367,9 @@ async def register(request: RegisterRequest):
                 user_store.update_api_key(requested_user_id, encrypted_api_key)
                 user = user_store.get_user(requested_user_id)
                 if not user:
-                    raise RuntimeError(f"Failed to reload user after update: {requested_user_id}")
+                    raise RuntimeError(
+                        f"Failed to reload user after update: {requested_user_id}"
+                    )
             else:
                 user = User(user_id=requested_user_id)
                 user.openrouter_api_key_encrypted = encrypted_api_key
@@ -375,8 +401,10 @@ async def register(request: RegisterRequest):
 
 
 @app.get("/api/auth/verify")
-async def verify_token(token: str = Query(..., description="Token to verify")):
+async def verify_token(token: str = Header(..., alias="Authorization")):
     """Verify token is valid"""
+    if token.startswith("Bearer "):
+        token = token[7:]
     is_valid, payload, error = token_manager.verify_token(token)
     if not is_valid:
         raise HTTPException(status_code=401, detail=error)
@@ -392,8 +420,10 @@ async def verify_token(token: str = Query(..., description="Token to verify")):
 
 
 @app.post("/api/auth/refresh")
-async def refresh_token(token: str = Query(..., description="Token to refresh")):
+async def refresh_token(token: str = Header(..., alias="Authorization")):
     """Refresh authentication token"""
+    if token.startswith("Bearer "):
+        token = token[7:]
     is_valid, payload, error = token_manager.verify_token(token)
     if not is_valid:
         raise HTTPException(status_code=401, detail=error)
@@ -411,12 +441,41 @@ async def refresh_token(token: str = Query(..., description="Token to refresh"))
 
 # === Health & Info ===
 
+
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint"""
+    checks: dict[str, bool] = {"healthy": True, "status": True}
+    try:
+        user_count = user_store.count_users()
+        checks["users_db"] = True
+    except Exception:
+        checks["users_db"] = False
+        checks["healthy"] = False
+    try:
+        vector_store.table_names()
+        checks["lancedb"] = True
+    except Exception:
+        checks["lancedb"] = False
+        checks["healthy"] = False
+    try:
+        store = MCPHandler._durable_store
+        if store is not None:
+            store.queue_counts()
+            checks["queue_db"] = True
+    except Exception:
+        checks["queue_db"] = False
+        checks["healthy"] = False
+    if not checks["healthy"]:
+        return {
+            "status": "degraded",
+            "checks": checks,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "version": "1.0.0",
+        }
     return {
         "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "checks": checks,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": "1.0.0",
     }
 
@@ -429,6 +488,7 @@ async def server_info():
         "version": "1.0.0",
         "protocol_version": "2025-03-26",
         "transport": "Streamable HTTP",
+        "reranker_model": settings.reranker_model,
         "llm_model": settings.llm_model,
         "embedding_model": settings.embedding_model,
         "window_size": settings.window_size,
@@ -438,6 +498,7 @@ async def server_info():
 
 
 # === MCP Protocol Endpoints (Streamable HTTP - 2025-03-26 spec) ===
+
 
 def _get_mcp_handler(user: User, api_key: str) -> MCPHandler:
     """Get or create MCP handler for user (legacy)"""
@@ -508,7 +569,7 @@ async def mcp_post_endpoint(
 
     # Authenticate
     user, api_key = await verify_bearer_token(authorization)
-    user_store.update_last_active(user.user_id)
+    await maybe_update_last_active(user.user_id)
 
     # Parse request body
     try:
@@ -553,11 +614,15 @@ async def mcp_post_endpoint(
         session = await get_or_create_session(user, api_key)
         session.initialized = True
         # Optionally log the session recovery
-        print(f"Auto-recovered expired session for user {user.user_id}, new session_id: {session.session_id}")
+        print(
+            f"Auto-recovered expired session for user {user.user_id}, new session_id: {session.session_id}"
+        )
 
     # Verify session belongs to this user
     if session.user_id != user.user_id:
-        raise HTTPException(status_code=403, detail="Session does not belong to this user")
+        raise HTTPException(
+            status_code=403, detail="Session does not belong to this user"
+        )
 
     # If only notifications or responses, return 202 Accepted
     if _is_notification_or_response_only(data):
@@ -622,7 +687,9 @@ async def mcp_get_endpoint(
 
     # Verify session belongs to this user
     if session.user_id != user.user_id:
-        raise HTTPException(status_code=403, detail="Session does not belong to this user")
+        raise HTTPException(
+            status_code=403, detail="Session does not belong to this user"
+        )
 
     # Generate unique stream ID
     stream_id = secrets.token_urlsafe(16)
@@ -692,7 +759,9 @@ async def mcp_delete_endpoint(
         raise HTTPException(status_code=404, detail="Session not found")
 
     if session.user_id != user.user_id:
-        raise HTTPException(status_code=403, detail="Session does not belong to this user")
+        raise HTTPException(
+            status_code=403, detail="Session does not belong to this user"
+        )
 
     # Delete session
     await delete_session(mcp_session_id)
@@ -701,6 +770,7 @@ async def mcp_delete_endpoint(
 
 # === Legacy MCP Endpoints (HTTP+SSE - 2024-11-05 spec) ===
 # Kept for backwards compatibility with older clients
+
 
 @app.get("/mcp/sse")
 async def mcp_sse_endpoint_legacy(
@@ -802,17 +872,10 @@ async def mcp_message_endpoint_legacy(
             raise HTTPException(status_code=404, detail="User not found")
         api_key = token_manager.decrypt_api_key(user.openrouter_api_key_encrypted)
         handler = _get_mcp_handler(user, api_key)
-    elif sid:
-        # Try to get session by ID
-        session = await get_session(sid)
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        handler = session.handler
-        user = session.user
     else:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    user_store.update_last_active(user.user_id)
+    await maybe_update_last_active(user.user_id)
 
     # Process message
     body = await request.body()
@@ -835,14 +898,18 @@ async def serve_frontend():
     if os.path.exists(index_path):
         with open(index_path, "r") as f:
             return HTMLResponse(content=f.read())
-    return HTMLResponse(content="<h1>SimpleMem MCP Server</h1><p>Frontend not found.</p>")
+    return HTMLResponse(
+        content="<h1>SimpleMem MCP Server</h1><p>Frontend not found.</p>"
+    )
 
 
 # === Entry Point ===
 
+
 def run_server(host: str = "0.0.0.0", port: int = 8000):
     """Run the HTTP server"""
     import uvicorn
+
     uvicorn.run(app, host=host, port=port)
 
 

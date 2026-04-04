@@ -7,6 +7,7 @@ Implements:
 - Sliding window processing for dialogue segmentation
 - Generates compact memory units with resolved coreferences and absolute timestamps
 """
+
 from typing import List, Optional
 from models.memory_entry import MemoryEntry, Dialogue
 from utils.llm_client import LLMClient
@@ -15,6 +16,7 @@ import config
 import json
 import asyncio
 import concurrent.futures
+import threading
 from functools import partial
 
 
@@ -28,130 +30,116 @@ class MemoryBuilder:
     3. Multi-view indexing: I(m_k) = {s_k, l_k, r_k}
     4. Intra-session consolidation during write (Section 3.2): by generating enough memory entries to ensure ALL information is captured
     """
+
     def __init__(
         self,
         llm_client: LLMClient,
         vector_store: VectorStore,
         window_size: int = None,
         enable_parallel_processing: bool = True,
-        max_parallel_workers: int = 3
+        max_parallel_workers: int = 3,
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
         self.window_size = window_size or config.WINDOW_SIZE
-        self.overlap_size = getattr(config, 'OVERLAP_SIZE', 0)
+        self.overlap_size = getattr(config, "OVERLAP_SIZE", 0)
         # step_size is how far the window advances each iteration; overlap retains
         # the last overlap_size dialogues so the next window has continuity context
         self.step_size = max(1, self.window_size - self.overlap_size)
 
         # Use config values as default if not explicitly provided
-        self.enable_parallel_processing = enable_parallel_processing if enable_parallel_processing is not None else getattr(config, 'ENABLE_PARALLEL_PROCESSING', True)
-        self.max_parallel_workers = max_parallel_workers if max_parallel_workers is not None else getattr(config, 'MAX_PARALLEL_WORKERS', 4)
+        self.enable_parallel_processing = (
+            enable_parallel_processing
+            if enable_parallel_processing is not None
+            else getattr(config, "ENABLE_PARALLEL_PROCESSING", True)
+        )
+        self.max_parallel_workers = (
+            max_parallel_workers
+            if max_parallel_workers is not None
+            else getattr(config, "MAX_PARALLEL_WORKERS", 4)
+        )
 
         # Dialogue buffer
         self.dialogue_buffer: List[Dialogue] = []
         self.processed_count = 0
+        self._lock = threading.Lock()
 
         # Previous window entries (for context)
         self.previous_entries: List[MemoryEntry] = []
 
     def add_dialogue(self, dialogue: Dialogue, auto_process: bool = True):
-        """
-        Add a dialogue to the buffer
-        """
-        self.dialogue_buffer.append(dialogue)
-
-        # Auto process
-        if auto_process and len(self.dialogue_buffer) >= self.window_size:
+        with self._lock:
+            self.dialogue_buffer.append(dialogue)
+            should_process = (
+                auto_process and len(self.dialogue_buffer) >= self.window_size
+            )
+        if should_process:
             self.process_window()
 
     def add_dialogues(self, dialogues: List[Dialogue], auto_process: bool = True):
-        """
-        Batch add dialogues with optional parallel processing
-        """
-        if self.enable_parallel_processing and len(dialogues) > self.window_size * 2:
-            # Use parallel processing for large batches
-            self.add_dialogues_parallel(dialogues)
-        else:
-            # Use sequential processing for smaller batches
+        with self._lock:
+            if (
+                self.enable_parallel_processing
+                and len(dialogues) > self.window_size * 2
+            ):
+                self._add_dialogues_parallel_locked(dialogues)
+                return
             for dialogue in dialogues:
-                self.add_dialogue(dialogue, auto_process=False)
+                self.dialogue_buffer.append(dialogue)
 
-            # Process complete windows
-            if auto_process:
-                while len(self.dialogue_buffer) >= self.window_size:
-                    self.process_window()
-    
-    def add_dialogues_parallel(self, dialogues: List[Dialogue]):
-        """
-        Add dialogues using parallel processing for better performance
-        """
-        # Snapshot pre-existing buffer items so the fallback can restore them
-        # if the buffer is cleared mid-way through parallel processing
+        if auto_process:
+            while True:
+                with self._lock:
+                    if len(self.dialogue_buffer) < self.window_size:
+                        break
+                    window = self.dialogue_buffer[: self.window_size]
+                    self.dialogue_buffer = self.dialogue_buffer[self.step_size :]
+                self._process_window_with(window)
+
+    def _add_dialogues_parallel_locked(self, dialogues: List[Dialogue]):
         pre_existing = list(self.dialogue_buffer)
         windows_to_process = []
         try:
-            # Add all dialogues to buffer first
             self.dialogue_buffer.extend(dialogues)
-
-            # Group into windows using step_size so that each window retains
-            # overlap_size dialogues of context from the previous window
             pos = 0
             while pos + self.window_size <= len(self.dialogue_buffer):
-                window = self.dialogue_buffer[pos:pos + self.window_size]
+                window = self.dialogue_buffer[pos : pos + self.window_size]
                 windows_to_process.append(window)
                 pos += self.step_size
-
-            # Add remaining dialogues as a smaller batch (no need to process separately)
             remaining = self.dialogue_buffer[pos:]
             if remaining:
                 windows_to_process.append(remaining)
-            self.dialogue_buffer = []  # Clear buffer since we're processing all
-
-            if windows_to_process:
-                print(f"\n[Parallel Processing] Processing {len(windows_to_process)} batches in parallel with {self.max_parallel_workers} workers")
-                print(f"Batch sizes: {[len(w) for w in windows_to_process]}")
-
-                # Process all windows/batches in parallel (including remaining dialogues)
-                self._process_windows_parallel(windows_to_process)
-
-        except Exception as e:
-            print(f"[Parallel Processing] Failed: {e}. Falling back to sequential processing...")
-            # Fallback: overlapping windows cannot be re-stacked naively.
-            # If the buffer was cleared (exception after line 107), restore the full
-            # original state: pre-existing items that were already in the buffer
-            # PLUS the new dialogues we were asked to process.
-            # If the buffer was NOT cleared (exception before line 107), it already
-            # contains pre_existing + dialogues, so leave it as-is.
+            self.dialogue_buffer = []
+        except Exception:
             if not self.dialogue_buffer:
                 self.dialogue_buffer = pre_existing + list(dialogues)
-            # process_window() uses step_size, so overlap is handled correctly here
-            while len(self.dialogue_buffer) >= self.window_size:
-                self.process_window()
+            raise
+
+        if windows_to_process:
+            print(
+                f"\n[Parallel Processing] Processing {len(windows_to_process)} batches in parallel with {self.max_parallel_workers} workers"
+            )
+            print(f"Batch sizes: {[len(w) for w in windows_to_process]}")
+            self._process_windows_parallel(windows_to_process)
 
     def process_window(self):
-        """
-        Process current window dialogues - Core logic
-        """
-        if not self.dialogue_buffer:
-            return
+        with self._lock:
+            if not self.dialogue_buffer:
+                return
+            window = self.dialogue_buffer[: self.window_size]
+            self.dialogue_buffer = self.dialogue_buffer[self.step_size :]
+        self._process_window_with(window)
 
-        # Extract window; advance by step_size to retain overlap_size dialogues
-        # at the tail so the next window has continuity context
-        window = self.dialogue_buffer[:self.window_size]
-        self.dialogue_buffer = self.dialogue_buffer[self.step_size:]
-
-        print(f"\nProcessing window: {len(window)} dialogues (processed {self.processed_count} so far)")
-
-        # Call LLM to generate memory entries
+    def _process_window_with(self, window: List[Dialogue]):
+        print(
+            f"\nProcessing window: {len(window)} dialogues (processed {self.processed_count} so far)"
+        )
         entries = self._generate_memory_entries(window)
-
-        # Store to database
         if entries:
             self.vector_store.add_entries(entries)
-            self.previous_entries = entries  # Save as context
-            self.processed_count += len(window)
-
+            with self._lock:
+                self.previous_entries = entries
+                self.processed_count += len(window)
         print(f"Generated {len(entries)} memory entries")
 
     def process_remaining(self):
@@ -159,7 +147,9 @@ class MemoryBuilder:
         Process remaining dialogues (fallback method, normally handled in parallel)
         """
         if self.dialogue_buffer:
-            print(f"\nProcessing remaining dialogues: {len(self.dialogue_buffer)} (fallback mode)")
+            print(
+                f"\nProcessing remaining dialogues: {len(self.dialogue_buffer)} (fallback mode)"
+            )
             entries = self._generate_memory_entries(self.dialogue_buffer)
             if entries:
                 self.vector_store.add_entries(entries)
@@ -190,12 +180,9 @@ class MemoryBuilder:
         messages = [
             {
                 "role": "system",
-                "content": "You are a professional information extraction assistant, skilled at extracting structured, unambiguous information from conversations. You must output valid JSON format."
+                "content": "You are a professional information extraction assistant, skilled at extracting structured, unambiguous information from conversations. You must output valid JSON format.",
             },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "user", "content": prompt},
         ]
 
         # Retry up to 3 times if parsing fails
@@ -204,13 +191,11 @@ class MemoryBuilder:
             try:
                 # Use JSON format if configured
                 response_format = None
-                if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
+                if hasattr(config, "USE_JSON_FORMAT") and config.USE_JSON_FORMAT:
                     response_format = {"type": "json_object"}
 
                 response = self.llm_client.chat_completion(
-                    messages,
-                    temperature=0.1,
-                    response_format=response_format
+                    messages, temperature=0.1, response_format=response_format
                 )
 
                 # Parse response
@@ -219,18 +204,21 @@ class MemoryBuilder:
 
             except Exception as e:
                 if attempt < max_retries - 1:
-                    print(f"Attempt {attempt + 1}/{max_retries} failed to parse LLM response: {e}")
+                    print(
+                        f"Attempt {attempt + 1}/{max_retries} failed to parse LLM response: {e}"
+                    )
                     print(f"Retrying...")
                 else:
-                    print(f"All {max_retries} attempts failed to parse LLM response: {e}")
-                    print(f"Raw response: {response[:500] if 'response' in locals() else 'No response'}")
+                    print(
+                        f"All {max_retries} attempts failed to parse LLM response: {e}"
+                    )
+                    print(
+                        f"Raw response: {response[:500] if 'response' in locals() else 'No response'}"
+                    )
                     return []
 
     def _build_extraction_prompt(
-        self,
-        dialogue_text: str,
-        dialogue_ids: List[int],
-        context: str
+        self, dialogue_text: str, dialogue_ids: List[int], context: str
     ) -> str:
         """
         Build LLM extraction prompt
@@ -306,9 +294,7 @@ Now process the above dialogues. Return ONLY the JSON array, no other explanatio
 """
 
     def _parse_llm_response(
-        self,
-        response: str,
-        dialogue_ids: List[int]
+        self, response: str, dialogue_ids: List[int]
     ) -> List[MemoryEntry]:
         """
         Parse LLM response to MemoryEntry list
@@ -329,60 +315,76 @@ Now process the above dialogues. Return ONLY the JSON array, no other explanatio
                 location=item.get("location"),
                 persons=item.get("persons", []),
                 entities=item.get("entities", []),
-                topic=item.get("topic")
+                topic=item.get("topic"),
             )
             entries.append(entry)
 
         return entries
-    
+
     def _process_windows_parallel(self, windows: List[List[Dialogue]]):
         """
         Process multiple windows in parallel using ThreadPoolExecutor
         """
         all_entries = []
-        
+
         # Use ThreadPoolExecutor for parallel processing
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_parallel_workers) as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_parallel_workers
+        ) as executor:
             # Submit all window processing tasks
             future_to_window = {}
             for i, window in enumerate(windows):
                 dialogue_ids = [d.dialogue_id for d in window]
-                future = executor.submit(self._generate_memory_entries_worker, window, dialogue_ids, i+1)
-                future_to_window[future] = (window, i+1)
-            
+                future = executor.submit(
+                    self._generate_memory_entries_worker, window, dialogue_ids, i + 1
+                )
+                future_to_window[future] = (window, i + 1)
+
             # Collect results as they complete
             for future in concurrent.futures.as_completed(future_to_window):
                 window, window_num = future_to_window[future]
                 try:
                     entries = future.result()
                     all_entries.extend(entries)
-                    print(f"[Parallel Processing] Window {window_num} completed: {len(entries)} entries")
+                    print(
+                        f"[Parallel Processing] Window {window_num} completed: {len(entries)} entries"
+                    )
                 except Exception as e:
                     print(f"[Parallel Processing] Window {window_num} failed: {e}")
-        
+
         # Store all entries to database in batch
         if all_entries:
-            print(f"\n[Parallel Processing] Storing {len(all_entries)} entries to database...")
+            print(
+                f"\n[Parallel Processing] Storing {len(all_entries)} entries to database..."
+            )
             self.vector_store.add_entries(all_entries)
             self.processed_count += sum(len(window) for window in windows)
-            
+
             # Update previous entries (use last window's entries for context)
             if all_entries:
-                self.previous_entries = all_entries[-10:]  # Keep last 10 entries for context
-        
+                self.previous_entries = all_entries[
+                    -10:
+                ]  # Keep last 10 entries for context
+
         print(f"[Parallel Processing] Completed processing {len(windows)} windows")
-    
-    def _generate_memory_entries_worker(self, window: List[Dialogue], dialogue_ids: List[int], window_num: int) -> List[MemoryEntry]:
+
+    def _generate_memory_entries_worker(
+        self, window: List[Dialogue], dialogue_ids: List[int], window_num: int
+    ) -> List[MemoryEntry]:
         """
         Worker function for parallel processing of a single batch (full window or remaining dialogues)
         """
         batch_size = len(window)
-        batch_type = "full window" if batch_size == self.window_size else f"remaining batch"
-        print(f"[Worker {window_num}] Processing {batch_type} with {batch_size} dialogues")
-        
+        batch_type = (
+            "full window" if batch_size == self.window_size else f"remaining batch"
+        )
+        print(
+            f"[Worker {window_num}] Processing {batch_type} with {batch_size} dialogues"
+        )
+
         # Build dialogue text
         dialogue_text = "\n".join([str(d) for d in window])
-        
+
         # Build context (shared across all workers - this is fine for parallel processing)
         context = ""
         if self.previous_entries:
@@ -397,12 +399,9 @@ Now process the above dialogues. Return ONLY the JSON array, no other explanatio
         messages = [
             {
                 "role": "system",
-                "content": "You are a professional information extraction assistant, skilled at extracting structured, unambiguous information from conversations. You must output valid JSON format."
+                "content": "You are a professional information extraction assistant, skilled at extracting structured, unambiguous information from conversations. You must output valid JSON format.",
             },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "user", "content": prompt},
         ]
 
         # Retry up to 3 times if parsing fails
@@ -411,13 +410,11 @@ Now process the above dialogues. Return ONLY the JSON array, no other explanatio
             try:
                 # Use JSON format if configured
                 response_format = None
-                if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
+                if hasattr(config, "USE_JSON_FORMAT") and config.USE_JSON_FORMAT:
                     response_format = {"type": "json_object"}
 
                 response = self.llm_client.chat_completion(
-                    messages,
-                    temperature=0.1,
-                    response_format=response_format
+                    messages, temperature=0.1, response_format=response_format
                 )
 
                 # Parse response
@@ -427,7 +424,11 @@ Now process the above dialogues. Return ONLY the JSON array, no other explanatio
 
             except Exception as e:
                 if attempt < max_retries - 1:
-                    print(f"[Worker {window_num}] Attempt {attempt + 1}/{max_retries} failed: {e}. Retrying...")
+                    print(
+                        f"[Worker {window_num}] Attempt {attempt + 1}/{max_retries} failed: {e}. Retrying..."
+                    )
                 else:
-                    print(f"[Worker {window_num}] All {max_retries} attempts failed: {e}")
+                    print(
+                        f"[Worker {window_num}] All {max_retries} attempts failed: {e}"
+                    )
                     return []
