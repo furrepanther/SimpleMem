@@ -7,6 +7,7 @@ Implements three-layer indexing I(m_k):
 - Symbolic Layer: r_k = E_sym(m_k) - Metadata filtering (SQL)
 """
 
+import logging
 from typing import List, Optional, Dict, Any
 import lancedb
 import pyarrow as pa
@@ -14,6 +15,8 @@ from models.memory_entry import MemoryEntry
 from utils.embedding import EmbeddingModel
 import config
 import os
+
+logger = logging.getLogger(__name__)
 
 
 class VectorStore:
@@ -71,10 +74,10 @@ class VectorStore:
 
         if self.table_name not in self.db.table_names():
             self.table = self.db.create_table(self.table_name, schema=schema)
-            print(f"Created new table: {self.table_name}")
+            logger.info("Created new table: %s", self.table_name)
         else:
             self.table = self.db.open_table(self.table_name)
-            print(f"Opened existing table: {self.table_name}")
+            logger.info("Opened existing table: %s", self.table_name)
 
     def _init_fts_index(self):
         """Initialize Full-Text Search index on lossless_restatement column."""
@@ -83,23 +86,21 @@ class VectorStore:
 
         try:
             if self._is_cloud_storage:
-                # Use native FTS for cloud storage (Tantivy only works with local filesystem)
                 self.table.create_fts_index(
                     "lossless_restatement", use_tantivy=False, replace=True
                 )
-                print("FTS index created (native mode for cloud storage)")
+                logger.info("FTS index created (native mode for cloud storage)")
             else:
-                # Use Tantivy FTS for local storage (better performance)
                 self.table.create_fts_index(
                     "lossless_restatement",
                     use_tantivy=True,
                     tokenizer_name="en_stem",
                     replace=True,
                 )
-                print("FTS index created (Tantivy mode)")
+                logger.info("FTS index created (Tantivy mode)")
             self._fts_initialized = True
         except Exception as e:
-            print(f"FTS index creation skipped: {e}")
+            logger.warning("FTS index creation skipped: %s", e)
 
     def _results_to_entries(self, results: List[dict]) -> List[MemoryEntry]:
         """Convert LanceDB results to MemoryEntry objects."""
@@ -119,7 +120,7 @@ class VectorStore:
                     )
                 )
             except Exception as e:
-                print(f"Warning: Failed to parse result: {e}")
+                logger.warning("Failed to parse result: %s", e)
                 continue
         return entries
 
@@ -148,7 +149,7 @@ class VectorStore:
             )
 
         self.table.add(data)
-        print(f"Added {len(entries)} memory entries")
+        logger.info("Added %d memory entries", len(entries))
 
         # Initialize FTS index after first data insertion
         if not self._fts_initialized:
@@ -168,7 +169,7 @@ class VectorStore:
             return self._results_to_entries(results)
 
         except Exception as e:
-            print(f"Error during semantic search: {e}")
+            logger.error("Error during semantic search: %s", e)
             return []
 
     def keyword_search(self, keywords: List[str], top_k: int = 3) -> List[MemoryEntry]:
@@ -186,7 +187,7 @@ class VectorStore:
             return self._results_to_entries(results)
 
         except Exception as e:
-            print(f"Error during keyword search: {e}")
+            logger.error("Error during keyword search: %s", e)
             return []
 
     @staticmethod
@@ -249,7 +250,7 @@ class VectorStore:
             return self._results_to_entries(results)
 
         except Exception as e:
-            print(f"Error during structured search: {e}")
+            logger.error("Error during structured search: %s", e)
             return []
 
     def get_all_entries(self) -> List[MemoryEntry]:
@@ -260,11 +261,11 @@ class VectorStore:
     def optimize(self):
         """Optimize table after bulk insertions for better query performance."""
         self.table.optimize()
-        print("Table optimized")
+        logger.info("Table optimized")
 
     def clear(self):
         """Clear all data and reinitialize table."""
         self.db.drop_table(self.table_name)
         self._fts_initialized = False
         self._init_table()
-        print("Database cleared")
+        logger.info("Database cleared")

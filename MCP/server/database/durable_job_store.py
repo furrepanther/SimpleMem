@@ -477,13 +477,6 @@ class DurableJobStore:
                     """
                 ).fetchone()
             counts = {str(r["status"]): int(r["c"]) for r in rows}
-            oldest = conn.execute(
-                """
-                SELECT MIN(created_at_utc) AS oldest
-                FROM durable_jobs
-                WHERE status IN ('pending', 'failed_retryable', 'processing')
-                """
-            ).fetchone()
             oldest_pending_age_s = 0.0
             if oldest and oldest["oldest"]:
                 try:
@@ -516,3 +509,22 @@ class DurableJobStore:
             )
             conn.commit()
             return int(cur.rowcount or 0)
+
+    def cancel_jobs_for_user(self, user_id: str) -> int:
+        now_iso = self._utc_now_iso()
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    """
+                    DELETE FROM durable_jobs
+                    WHERE user_id = ?
+                      AND status IN ('pending', 'failed_retryable', 'processing')
+                    """,
+                    (user_id,),
+                )
+                conn.execute("COMMIT")
+                return int(cur.rowcount or 0)
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise

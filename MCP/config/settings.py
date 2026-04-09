@@ -62,6 +62,15 @@ class Settings:
             os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         )
     )
+    openrouter_rerank_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "OPENROUTER_RERANK_BASE_URL",
+            os.getenv(
+                "OPENROUTER_EMBED_BASE_URL",
+                os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            ),
+        )
+    )
 
     # Common LLM Configuration
     llm_model: str = field(
@@ -102,7 +111,7 @@ class Settings:
         default_factory=lambda: int(
             os.getenv(
                 "RERANK_CANDIDATE_CAP",
-                "16",
+                "32",
             )
         )
     )

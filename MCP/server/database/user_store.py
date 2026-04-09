@@ -11,8 +11,6 @@ from typing import Optional, List
 
 from contextlib import contextmanager
 
-from contextlib import contextmanager
-
 from ..auth.models import User
 
 
@@ -22,6 +20,7 @@ class UserStore:
     def __init__(self, db_path: str = "./data/users.db"):
         self.db_path = db_path
         self._local = threading.local()
+        self._init_lock = threading.Lock()
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._init_db()
 
@@ -45,21 +44,22 @@ class UserStore:
         return conn
 
     def _init_db(self):
-        conn = self._get_connection()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id TEXT PRIMARY KEY,
-                openrouter_api_key_encrypted TEXT NOT NULL,
-                table_name TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL,
-                last_active TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_users_table_name
-            ON users(table_name)
-        """)
-        conn.commit()
+        with self._init_lock:
+            conn = self._get_connection()
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id TEXT PRIMARY KEY,
+                    openrouter_api_key_encrypted TEXT NOT NULL,
+                    table_name TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    last_active TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_users_table_name
+                ON users(table_name)
+            """)
+            conn.commit()
 
     def create_user(self, user: User) -> User:
         conn = self._get_connection()
@@ -139,6 +139,7 @@ class UserStore:
         return cursor.rowcount > 0
 
     def list_users(self, limit: int = 100, offset: int = 0) -> List[User]:
+        limit = min(limit, 1000)
         conn = self._get_connection()
         rows = conn.execute(
             "SELECT * FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?",

@@ -106,7 +106,7 @@ class MultiTenantVectorStore:
     def _get_table(self, table_name: str) -> Any:
         """Get or create a user's table"""
         if table_name not in self._tables:
-            if table_name in self.db.table_names():
+            if table_name in self.table_names():
                 self._tables[table_name] = self.db.open_table(table_name)
             else:
                 # Create new table with schema
@@ -115,10 +115,32 @@ class MultiTenantVectorStore:
                     table_name,
                     schema=schema,
                 )
-            self._table_dimensions[table_name] = self._infer_table_dimension(
-                self._tables[table_name]
-            )
+        self._table_dimensions[table_name] = self._infer_table_dimension(
+            self._tables[table_name]
+        )
         return self._tables[table_name]
+
+    def table_names(self) -> List[str]:
+        """
+        Return current LanceDB table names.
+
+        LanceDB has renamed this API over time, so we keep a small
+        compatibility shim here and prefer the newer list_tables() when
+        available.
+        """
+        try:
+            list_tables = getattr(self.db, "list_tables", None)
+            if callable(list_tables):
+                table_listing = list_tables()
+                table_names = getattr(table_listing, "tables", None)
+                if table_names is not None:
+                    return [str(name) for name in table_names]
+                if isinstance(table_listing, dict) and "tables" in table_listing:
+                    return [str(name) for name in table_listing["tables"]]
+                return [str(name) for name in list(table_listing)]
+            return [str(name) for name in self.db.table_names()]
+        except Exception:
+            return []
 
     async def add_entries(
         self,
@@ -459,7 +481,7 @@ class MultiTenantVectorStore:
             if table_name in self._tables:
                 del self._tables[table_name]
 
-            if table_name in self.db.table_names():
+            if table_name in self.table_names():
                 self.db.drop_table(table_name)
 
             # Recreate empty table
@@ -476,7 +498,7 @@ class MultiTenantVectorStore:
             if table_name in self._tables:
                 del self._tables[table_name]
 
-            if table_name in self.db.table_names():
+            if table_name in self.table_names():
                 self.db.drop_table(table_name)
 
             return True

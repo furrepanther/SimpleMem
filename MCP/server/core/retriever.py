@@ -47,8 +47,8 @@ class Retriever:
         enable_planning: bool = True,
         enable_reflection: bool = True,
         enable_reranking: bool = True,
-        rerank_candidate_cap: int = 100,
-        rerank_document_max_chars: int = 1500,
+        rerank_candidate_cap: int = 32,
+        rerank_document_max_chars: int = 1200,
         max_reflection_rounds: int = 2,
         temperature: float = 0.1,
     ):

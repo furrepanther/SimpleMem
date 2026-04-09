@@ -5,7 +5,8 @@ SimpleMem MCP Server - Runner Script
 Starts the HTTP server which provides:
 - Web UI for configuration (/)
 - REST API for memory operations (/api/*)
-- MCP over SSE for Claude Desktop (/mcp/*)
+- MCP over Streamable HTTP for Claude Desktop (/mcp)
+- Legacy SSE compatibility remains available at (/mcp/sse)
 """
 
 import argparse
@@ -41,7 +42,8 @@ def main():
     print()
     print(f"  Web UI:     http://localhost:{args.port}/")
     print(f"  REST API:   http://localhost:{args.port}/api/")
-    print(f"  MCP (SSE):  http://localhost:{args.port}/mcp/sse?token=<TOKEN>")
+    print(f"  MCP:        http://localhost:{args.port}/mcp")
+    print(f"  MCP (legacy SSE): http://localhost:{args.port}/mcp/sse")
     print()
     print("-" * 60)
 

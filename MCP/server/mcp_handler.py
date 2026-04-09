@@ -399,10 +399,10 @@ class MCPHandler:
                 enable_reflection=self.settings.enable_reflection,
                 enable_reranking=getattr(self.settings, "enable_reranking", True),
                 rerank_candidate_cap=getattr(
-                    self.settings, "rerank_candidate_cap", 100
+                    self.settings, "rerank_candidate_cap", 32
                 ),
                 rerank_document_max_chars=getattr(
-                    self.settings, "rerank_document_max_chars", 1500
+                    self.settings, "rerank_document_max_chars", 1200
                 ),
                 max_reflection_rounds=self.settings.max_reflection_rounds,
                 temperature=self.settings.llm_temperature,
@@ -549,7 +549,8 @@ class MCPHandler:
             )
             response.raise_for_status()
             payload = response.json()
-        except Exception:
+        except Exception as exc:
+            logging.getLogger(__name__).warning("fastpath_error: %s", exc)
             return None
 
         rows = payload.get("results")
@@ -882,10 +883,10 @@ class MCPHandler:
                     error={"code": -32700, "message": f"Parse error: {exc}"}
                 ).to_dict()
             )
-        except Exception as exc:
+        except Exception:
             return json.dumps(
                 JsonRpcResponse(
-                    error={"code": -32603, "message": f"Internal error: {exc}"}
+                    error={"code": -32603, "message": "Internal error"}
                 ).to_dict()
             )
 
@@ -911,9 +912,9 @@ class MCPHandler:
         try:
             result = await handler(request.params or {})
             return JsonRpcResponse(id=request.id, result=result)
-        except Exception as exc:
+        except Exception:
             return JsonRpcResponse(
-                id=request.id, error={"code": -32603, "message": str(exc)}
+                id=request.id, error={"code": -32603, "message": "Internal error"}
             )
 
     async def _handle_initialize(self, params: dict) -> dict:
@@ -1558,14 +1559,7 @@ class MCPHandler:
     async def _tool_memory_clear(self, args: dict) -> dict:
         store = MCPHandler._durable_store
         if store is not None:
-            counts = store.queue_counts(user_id=self.user.user_id)
-            pending = int(counts.get("pending", 0))
-            processing = int(counts.get("processing", 0))
-            if pending > 0 or processing > 0:
-                return {
-                    "success": False,
-                    "message": f"Cannot clear: {pending} pending and {processing} processing jobs exist. Wait for pending operations to complete.",
-                }
+            store.cancel_jobs_for_user(self.user.user_id)
         success = await self.vector_store.clear_table(self.user.table_name)
         return {
             "success": success,

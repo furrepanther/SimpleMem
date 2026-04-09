@@ -19,6 +19,7 @@ class OpenRouterClient:
         api_key: str,
         base_url: str = "https://openrouter.ai/api/v1",
         embedding_base_url: Optional[str] = None,
+        rerank_base_url: Optional[str] = None,
         llm_model: str = "openai/gpt-4.1-mini",
         embedding_model: str = "BAAI/bge-m3",
         reranker_model: str = "BAAI/bge-reranker-v2-m3",
@@ -26,6 +27,9 @@ class OpenRouterClient:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.embedding_base_url = (embedding_base_url or base_url).rstrip("/")
+        self.rerank_base_url = (
+            rerank_base_url or embedding_base_url or base_url
+        ).rstrip("/")
         self.llm_model = llm_model
         self.embedding_model = embedding_model
         self.reranker_model = reranker_model
@@ -33,20 +37,21 @@ class OpenRouterClient:
         # Lazy import to avoid issues if not installed
         self._chat_client = None
         self._embed_client = None
+        self._rerank_client = None
 
     @staticmethod
     def _is_local_base_url(base_url: str) -> bool:
         host = (urlparse(base_url or "").hostname or "").lower()
         return host in {"127.0.0.1", "localhost", "::1"}
 
-    def _build_headers(self) -> Dict[str, str]:
+    def _build_headers(self, base_url: Optional[str] = None) -> Dict[str, str]:
         headers: Dict[str, str] = {
             "Content-Type": "application/json",
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         # OpenRouter-specific headers are not required for local gateways.
-        if not self._is_local_base_url(self.base_url):
+        if not self._is_local_base_url(base_url or self.base_url):
             headers["HTTP-Referer"] = "https://simplemem.app"
             headers["X-Title"] = "SimpleMem MCP Server"
         return headers
@@ -58,7 +63,7 @@ class OpenRouterClient:
 
             self._chat_client = httpx.AsyncClient(
                 base_url=self.base_url,
-                headers=self._build_headers(),
+                headers=self._build_headers(self.base_url),
                 timeout=120.0,
             )
         return self._chat_client
@@ -70,10 +75,22 @@ class OpenRouterClient:
 
             self._embed_client = httpx.AsyncClient(
                 base_url=self.embedding_base_url,
-                headers=self._build_headers(),
+                headers=self._build_headers(self.embedding_base_url),
                 timeout=120.0,
             )
         return self._embed_client
+
+    def _get_rerank_client(self):
+        """Get or create the rerank HTTP client."""
+        if self._rerank_client is None:
+            import httpx
+
+            self._rerank_client = httpx.AsyncClient(
+                base_url=self.rerank_base_url,
+                headers=self._build_headers(self.rerank_base_url),
+                timeout=120.0,
+            )
+        return self._rerank_client
 
     async def close(self):
         """Close the HTTP client"""
@@ -83,6 +100,9 @@ class OpenRouterClient:
         if self._embed_client:
             await self._embed_client.aclose()
             self._embed_client = None
+        if self._rerank_client:
+            await self._rerank_client.aclose()
+            self._rerank_client = None
 
     async def chat_completion(
         self,
@@ -213,7 +233,7 @@ class OpenRouterClient:
         if not documents:
             return []
 
-        client = self._get_embed_client()
+        client = self._get_rerank_client()
         payload: Dict[str, Any] = {
             "model": self.reranker_model,
             "query": query,
@@ -221,7 +241,7 @@ class OpenRouterClient:
         }
         if top_n is not None:
             payload["top_n"] = max(1, int(top_n))
-        if instruction and self._is_local_base_url(self.embedding_base_url):
+        if instruction and self._is_local_base_url(self.rerank_base_url):
             payload["instruction"] = instruction
 
         response = await client.post("/rerank", json=payload)
@@ -420,12 +440,14 @@ class OpenRouterClientManager:
         self,
         base_url: str = "https://openrouter.ai/api/v1",
         embedding_base_url: Optional[str] = None,
+        rerank_base_url: Optional[str] = None,
         llm_model: str = "openai/gpt-4.1-mini",
         embedding_model: str = "BAAI/bge-m3",
         reranker_model: str = "BAAI/bge-reranker-v2-m3",
     ):
         self.base_url = base_url
         self.embedding_base_url = embedding_base_url or base_url
+        self.rerank_base_url = rerank_base_url or self.embedding_base_url
         self.llm_model = llm_model
         self.embedding_model = embedding_model
         self.reranker_model = reranker_model
@@ -459,6 +481,7 @@ class OpenRouterClientManager:
             api_key=api_key,
             base_url=self.base_url,
             embedding_base_url=self.embedding_base_url,
+            rerank_base_url=self.rerank_base_url,
             llm_model=self.llm_model,
             embedding_model=self.embedding_model,
             reranker_model=self.reranker_model,
