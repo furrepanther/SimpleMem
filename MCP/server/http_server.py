@@ -20,6 +20,7 @@ import os
 import uuid
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
@@ -297,6 +298,17 @@ async def maybe_update_last_active(user_id: str) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for the app"""
+    global _default_executor
+    loop = asyncio.get_running_loop()
+    max_workers = max(
+        2,
+        int(os.getenv("ANTIGRAVITY_SIMPLEMEM_TO_THREAD_MAX_WORKERS", "4")),
+    )
+    _default_executor = ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="simplemem-to-thread",
+    )
+    loop.set_default_executor(_default_executor)
     print("SimpleMem MCP Server started")
     print(f"  - LLM Model: {settings.llm_model}")
     print(f"  - Embedding Model: {settings.embedding_model}")
@@ -321,6 +333,10 @@ async def lifespan(app: FastAPI):
         await cleanup_task
     except asyncio.CancelledError:
         pass
+
+    if _default_executor is not None:
+        _default_executor.shutdown(wait=False, cancel_futures=True)
+        _default_executor = None
 
     for task in MCPHandler._worker_tasks:
         task.cancel()
@@ -359,6 +375,7 @@ class _RateLimiter:
 
 
 _request_limiter = _RateLimiter(max_requests=100, window_seconds=60)
+_default_executor: ThreadPoolExecutor | None = None
 
 
 # === FastAPI App ===
@@ -373,6 +390,8 @@ app = FastAPI(
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
+    if request.url.path in {"/api/health", "/api/server/info"}:
+        return await call_next(request)
     client_ip = request.client.host if request.client else "unknown"
     if not _request_limiter.is_allowed(client_ip):
         return JSONResponse(status_code=429, content={"error": "Too many requests"})

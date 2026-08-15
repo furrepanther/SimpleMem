@@ -88,6 +88,7 @@ class MCPHandler:
     _query_cache_order: deque[str] = deque()
     _query_inflight: dict[str, asyncio.Future] = {}
     _query_inflight_ts: dict[str, float] = {}
+    _memory_cache_generation: int = 0
 
     _write_stats: dict[str, int] = {
         "accepted": 0,
@@ -431,11 +432,57 @@ class MCPHandler:
         MCPHandler._shared_fastpath_client = client
         return client
 
+    def _memory_backend_base_url(self) -> str:
+        backend_url = str(
+            getattr(self.settings, "memory_retrieve_backend_url", "") or ""
+        ).strip()
+        if not backend_url:
+            return ""
+        return re.sub(r"/search/?$", "", backend_url.rstrip("/"))
+
+    def _uses_memory_backend_id(self, entry_id: str) -> bool:
+        mem_id = str(entry_id or "").strip()
+        return bool(re.match(r"^(sm|lg|la)-", mem_id))
+
+    async def _memory_mutation_backend_call(
+        self,
+        *,
+        action: str,
+        entry_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        base_url = self._memory_backend_base_url()
+        if not base_url:
+            return {
+                "ok": False,
+                "error": "memory_backend_unconfigured",
+                "entry_id": entry_id,
+            }
+        timeout_s = (
+            float(getattr(self.settings, "memory_retrieve_backend_timeout_ms", 3000))
+            / 1000.0
+        )
+        client = await self._get_fastpath_client(timeout_s)
+        body = {
+            "memory_id": entry_id,
+            "user_id": self.user.user_id,
+            **payload,
+        }
+        response = await client.post(f"{base_url}/memory/{action}", json=body)
+        response.raise_for_status()
+        out = response.json()
+        if isinstance(out, dict):
+            out.setdefault("entry_id", entry_id)
+            out.setdefault("memory_id", entry_id)
+            return out
+        return {"ok": True, "entry_id": entry_id, "memory_id": entry_id, "result": out}
+
     async def _memory_retrieve_fastpath(
         self,
         *,
         query: str,
         top_k: int,
+        force_exact: bool = False,
     ) -> dict[str, Any] | None:
         backend_url = str(
             getattr(self.settings, "memory_retrieve_backend_url", "") or ""
@@ -521,6 +568,8 @@ class MCPHandler:
                 or ""
             )
             return {
+                "memory_id": row.get("memory_id") or row.get("id"),
+                "entry_id": row.get("entry_id") or row.get("memory_id") or row.get("id"),
                 "content": str(content or ""),
                 "timestamp": timestamp,
                 "location": metadata.get("location"),
@@ -545,6 +594,7 @@ class MCPHandler:
                     "query": query,
                     "limit": top_k,
                     "user_id": self.user.user_id,
+                    "force_exact": force_exact,
                 },
             )
             response.raise_for_status()
@@ -662,6 +712,27 @@ class MCPHandler:
         while len(cls._query_cache_order) > limit:
             victim = cls._query_cache_order.popleft()
             cls._query_cache.pop(victim, None)
+
+    @classmethod
+    def _invalidate_memory_caches(cls) -> None:
+        cls._memory_cache_generation += 1
+        cls._retrieve_cache.clear()
+        cls._retrieve_cache_order.clear()
+        cls._retrieve_negative_cache.clear()
+        cls._retrieve_negative_cache_order.clear()
+        cls._query_cache.clear()
+        cls._query_cache_order.clear()
+
+    @staticmethod
+    def _string_list_arg(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        text = str(value).strip()
+        if not text:
+            return []
+        return [part.strip() for part in text.split(",") if part.strip()]
 
     @staticmethod
     def _derive_keywords_for_memory_store(
@@ -930,6 +1001,7 @@ class MCPHandler:
             "instructions": (
                 "Use memory_store for durable single-entry writes (memory_add is a legacy alias). "
                 "Use memory_add_batch for durable batch writes. "
+                "Use memory_delete and memory_update for targeted single-memory mutation. "
                 "Writes are accepted only after durable enqueue and return a job_id. "
                 "Use memory_job_status for completion state."
             ),
@@ -1133,9 +1205,54 @@ class MCPHandler:
                     },
                 },
                 {
-                    "name": "memory_clear",
-                    "description": "Clear all memories for this user.",
-                    "inputSchema": {"type": "object", "properties": {}},
+                    "name": "memory_delete",
+                    "description": "Delete one memory by entry_id or memory_id.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "entry_id": {
+                                "type": "string",
+                                "description": "Memory entry ID returned by memory_retrieve",
+                            },
+                            "memory_id": {
+                                "type": "string",
+                                "description": "Alias of entry_id",
+                            },
+                        },
+                        "required": [],
+                    },
+                },
+                {
+                    "name": "memory_update",
+                    "description": "Update one memory by entry_id or memory_id. Pass content/text for the memory body and optional simple metadata fields.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "entry_id": {
+                                "type": "string",
+                                "description": "Memory entry ID returned by memory_retrieve",
+                            },
+                            "memory_id": {
+                                "type": "string",
+                                "description": "Alias of entry_id",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Replacement memory content",
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "Alias of content",
+                            },
+                            "keywords": {"type": "array", "items": {"type": "string"}},
+                            "timestamp": {"type": "string"},
+                            "location": {"type": "string"},
+                            "persons": {"type": "array", "items": {"type": "string"}},
+                            "entities": {"type": "array", "items": {"type": "string"}},
+                            "topic": {"type": "string"},
+                        },
+                        "required": [],
+                    },
                 },
                 {
                     "name": "memory_stats",
@@ -1155,7 +1272,8 @@ class MCPHandler:
             "memory_job_status": self._tool_memory_job_status,
             "memory_query": self._tool_memory_query,
             "memory_retrieve": self._tool_memory_retrieve,
-            "memory_clear": self._tool_memory_clear,
+            "memory_delete": self._tool_memory_delete,
+            "memory_update": self._tool_memory_update,
             "memory_stats": self._tool_memory_stats,
         }
         handler = handlers.get(name)
@@ -1372,6 +1490,7 @@ class MCPHandler:
             return dict(await asyncio.shield(inflight))
         loop = asyncio.get_running_loop()
         owner_future: asyncio.Future = loop.create_future()
+        cache_generation = MCPHandler._memory_cache_generation
         MCPHandler._add_inflight(
             MCPHandler._query_inflight,
             MCPHandler._query_inflight_ts,
@@ -1441,11 +1560,12 @@ class MCPHandler:
                 "contexts_used": len(contexts),
                 "top_k": top_k,
             }
-            self._query_cache_put(
-                key=cache_key,
-                payload=result,
-                max_entries=cache_limit,
-            )
+            if cache_generation == MCPHandler._memory_cache_generation:
+                self._query_cache_put(
+                    key=cache_key,
+                    payload=result,
+                    max_entries=cache_limit,
+                )
             owner_future.set_result(dict(result))
             return result
         except Exception as exc:
@@ -1467,6 +1587,7 @@ class MCPHandler:
         if not query:
             raise ValueError("memory_retrieve requires query")
         top_k = int(args.get("top_k", args.get("limit", 10)))
+        force_exact = bool(args.get("force_exact", False))
         retrieve_cache_ttl_ms = int(
             getattr(self.settings, "memory_retrieve_result_cache_ttl_ms", 2000)
         )
@@ -1480,7 +1601,7 @@ class MCPHandler:
             getattr(self.settings, "memory_retrieve_negative_cache_entries", 512)
         )
         cache_key = (
-            f"{self.user.user_id}|{top_k}|{self._normalize_retrieve_query(query)}"
+            f"{self.user.user_id}|{top_k}|exact={int(force_exact)}|{self._normalize_retrieve_query(query)}"
         )
         cached_result = self._retrieve_cache_get(
             key=cache_key, ttl_ms=retrieve_cache_ttl_ms
@@ -1497,13 +1618,18 @@ class MCPHandler:
             return dict(await asyncio.shield(inflight))
         loop = asyncio.get_running_loop()
         owner_future: asyncio.Future = loop.create_future()
+        cache_generation = MCPHandler._memory_cache_generation
         MCPHandler._add_inflight(
             MCPHandler._retrieve_inflight,
             MCPHandler._retrieve_inflight_ts,
             cache_key,
             owner_future,
         )
-        fastpath = await self._memory_retrieve_fastpath(query=query, top_k=top_k)
+        fastpath = await self._memory_retrieve_fastpath(
+            query=query,
+            top_k=top_k,
+            force_exact=force_exact,
+        )
         try:
             if fastpath is not None and int(fastpath.get("total", 0) or 0) > 0:
                 result = fastpath
@@ -1519,6 +1645,7 @@ class MCPHandler:
                     "query": query,
                     "results": [
                         {
+                            "entry_id": e.entry_id,
                             "content": e.lossless_restatement,
                             "timestamp": e.timestamp,
                             "location": e.location,
@@ -1531,16 +1658,18 @@ class MCPHandler:
                     "total": len(entries),
                 }
                 if int(result.get("total", 0) or 0) <= 0:
-                    self._retrieve_negative_cache_put(
-                        key=cache_key,
-                        payload=result,
-                        max_entries=negative_cache_limit,
-                    )
-            self._retrieve_cache_put(
-                key=cache_key,
-                payload=result,
-                max_entries=retrieve_cache_limit,
-            )
+                    if cache_generation == MCPHandler._memory_cache_generation:
+                        self._retrieve_negative_cache_put(
+                            key=cache_key,
+                            payload=result,
+                            max_entries=negative_cache_limit,
+                        )
+            if cache_generation == MCPHandler._memory_cache_generation:
+                self._retrieve_cache_put(
+                    key=cache_key,
+                    payload=result,
+                    max_entries=retrieve_cache_limit,
+                )
             owner_future.set_result(dict(result))
             return result
         except Exception as exc:
@@ -1556,15 +1685,101 @@ class MCPHandler:
                     owner_future,
                 )
 
-    async def _tool_memory_clear(self, args: dict) -> dict:
-        store = MCPHandler._durable_store
-        if store is not None:
-            store.cancel_jobs_for_user(self.user.user_id)
-        success = await self.vector_store.clear_table(self.user.table_name)
-        return {
-            "success": success,
-            "message": "All memories cleared" if success else "Failed",
-        }
+    def _entry_id_arg(self, args: dict) -> str:
+        return str(args.get("entry_id") or args.get("memory_id") or "").strip()
+
+    async def _tool_memory_delete(self, args: dict) -> dict:
+        entry_id = self._entry_id_arg(args)
+        if not entry_id:
+            return {"deleted": False, "found": False, "error": "entry_id_required"}
+        route_backend = self._uses_memory_backend_id(entry_id)
+        if not route_backend and self._memory_backend_base_url():
+            route_backend = (
+                await self.vector_store.get_entry(self.user.table_name, entry_id)
+            ) is None
+        if route_backend:
+            try:
+                result = await self._memory_mutation_backend_call(
+                    action="delete",
+                    entry_id=entry_id,
+                    payload={
+                        "reason": str(args.get("reason", "mcp_memory_delete") or ""),
+                    },
+                )
+            except Exception as exc:
+                return {
+                    "deleted": False,
+                    "found": False,
+                    "entry_id": entry_id,
+                    "error": f"memory_backend_delete_failed:{exc}",
+                }
+        else:
+            result = await self.vector_store.delete_entry(self.user.table_name, entry_id)
+        if result.get("deleted") or result.get("queued"):
+            MCPHandler._invalidate_memory_caches()
+        return result
+
+    async def _tool_memory_update(self, args: dict) -> dict:
+        entry_id = self._entry_id_arg(args)
+        if not entry_id:
+            return {"updated": False, "found": False, "error": "entry_id_required"}
+
+        updates: dict[str, Any] = {}
+        content = str(args.get("content", args.get("text", ""))).strip()
+        if content:
+            updates["lossless_restatement"] = content
+        for key in ("timestamp", "location", "topic"):
+            if key in args:
+                updates[key] = str(args.get(key, "") or "").strip()
+        for key in ("keywords", "persons", "entities"):
+            if key in args:
+                updates[key] = self._string_list_arg(args.get(key))
+        if not updates:
+            return {"updated": False, "found": False, "error": "updates_required"}
+
+        route_backend = self._uses_memory_backend_id(entry_id)
+        if not route_backend and self._memory_backend_base_url():
+            route_backend = (
+                await self.vector_store.get_entry(self.user.table_name, entry_id)
+            ) is None
+        if route_backend:
+            try:
+                result = await self._memory_mutation_backend_call(
+                    action="update",
+                    entry_id=entry_id,
+                    payload={
+                        "content": content,
+                        "metadata": {
+                            k: v
+                            for k, v in updates.items()
+                            if k != "lossless_restatement"
+                        },
+                    },
+                )
+            except Exception as exc:
+                return {
+                    "updated": False,
+                    "found": False,
+                    "entry_id": entry_id,
+                    "error": f"memory_backend_update_failed:{exc}",
+                }
+            if result.get("updated") or result.get("queued"):
+                MCPHandler._invalidate_memory_caches()
+            return result
+
+        embedding = None
+        if content:
+            llm_client = self.client_manager.get_client(self.api_key)
+            embedding = await llm_client.create_single_embedding(content)
+        result = await self.vector_store.update_entry(
+            self.user.table_name,
+            entry_id,
+            updates,
+            embedding=embedding,
+        )
+        if result.get("updated"):
+            MCPHandler._invalidate_memory_caches()
+        return result
 
     async def _tool_memory_stats(self, args: dict) -> dict:
         stats = self.vector_store.get_stats(self.user.table_name)

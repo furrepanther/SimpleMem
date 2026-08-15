@@ -103,6 +103,62 @@ class MultiTenantVectorStore:
         except Exception:
             return []
 
+    @staticmethod
+    def _escape_filter_value(value: str) -> str:
+        """Escape a value for a LanceDB SQL-style string filter."""
+        return str(value).replace("'", "''")
+
+    @staticmethod
+    def _text_or_empty(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value)
+
+    def _row_to_entry(self, row: Any) -> MemoryEntry:
+        return MemoryEntry(
+            entry_id=str(row["entry_id"]),
+            lossless_restatement=str(row["lossless_restatement"] or ""),
+            keywords=self._list_or_empty(row["keywords"]),
+            timestamp=row["timestamp"] if row["timestamp"] else None,
+            location=row["location"] if row["location"] else None,
+            persons=self._list_or_empty(row["persons"]),
+            entities=self._list_or_empty(row["entities"]),
+            topic=row["topic"] if row["topic"] else None,
+        )
+
+    def _row_to_record(
+        self,
+        row: Any,
+        *,
+        table_dim: int,
+        updates: dict[str, Any] | None = None,
+        embedding: List[float] | None = None,
+    ) -> dict[str, Any]:
+        updates = updates or {}
+        vector = (
+            self._adapt_vector(embedding, table_dim)
+            if embedding is not None
+            else self._adapt_vector(self._list_or_empty(row["vector"]), table_dim)
+        )
+        return {
+            "entry_id": str(row["entry_id"]),
+            "lossless_restatement": self._text_or_empty(
+                updates.get("lossless_restatement", row["lossless_restatement"] or "")
+            ),
+            "keywords": self._list_or_empty(updates.get("keywords", row["keywords"])),
+            "timestamp": self._text_or_empty(
+                updates.get("timestamp", row["timestamp"] or "")
+            ),
+            "location": self._text_or_empty(
+                updates.get("location", row["location"] or "")
+            ),
+            "persons": self._list_or_empty(updates.get("persons", row["persons"])),
+            "entities": self._list_or_empty(updates.get("entities", row["entities"])),
+            "topic": self._text_or_empty(updates.get("topic", row["topic"] or "")),
+            "vector": vector,
+            "created_at": self._text_or_empty(row["created_at"] or ""),
+        }
+
     def _get_table(self, table_name: str) -> Any:
         """Get or create a user's table"""
         if table_name not in self._tables:
@@ -466,6 +522,130 @@ class MultiTenantVectorStore:
         except Exception as e:
             print(f"Get all entries error: {e}")
             return []
+
+    async def get_entry(self, table_name: str, entry_id: str) -> MemoryEntry | None:
+        """Get a single entry by ID from a user's table."""
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return None
+        table = await asyncio.to_thread(self._get_table, table_name)
+        try:
+            if await asyncio.to_thread(table.count_rows) == 0:
+                return None
+            df = await asyncio.to_thread(table.to_pandas)
+            matches = df[df["entry_id"] == entry_id]
+            if matches.empty:
+                return None
+            return self._row_to_entry(matches.iloc[0])
+        except Exception as e:
+            print(f"Get entry error: {e}")
+            return None
+
+    async def delete_entry(self, table_name: str, entry_id: str) -> dict[str, Any]:
+        """Delete one entry by ID from a user's table."""
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return {"found": False, "deleted": False, "error": "entry_id_required"}
+        table = await asyncio.to_thread(self._get_table, table_name)
+        try:
+            if await asyncio.to_thread(table.count_rows) == 0:
+                return {"found": False, "deleted": False, "entry_id": entry_id}
+            existing = await self.get_entry(table_name, entry_id)
+            if existing is None:
+                return {"found": False, "deleted": False, "entry_id": entry_id}
+            where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
+            await asyncio.to_thread(lambda: table.delete(where))
+            deleted = await self.get_entry(table_name, entry_id) is None
+            return {"found": True, "deleted": deleted, "entry_id": entry_id}
+        except Exception as e:
+            print(f"Delete entry error: {e}")
+            return {
+                "found": True,
+                "deleted": False,
+                "entry_id": entry_id,
+                "error": str(e),
+            }
+
+    async def update_entry(
+        self,
+        table_name: str,
+        entry_id: str,
+        updates: dict[str, Any],
+        *,
+        embedding: List[float] | None = None,
+    ) -> dict[str, Any]:
+        """Update one entry by ID in a user's table."""
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return {"found": False, "updated": False, "error": "entry_id_required"}
+        allowed = {
+            "lossless_restatement",
+            "keywords",
+            "timestamp",
+            "location",
+            "persons",
+            "entities",
+            "topic",
+        }
+        updates = {k: v for k, v in dict(updates or {}).items() if k in allowed}
+        if not updates and embedding is None:
+            return {"found": False, "updated": False, "error": "updates_required"}
+
+        table = await asyncio.to_thread(self._get_table, table_name)
+        try:
+            if await asyncio.to_thread(table.count_rows) == 0:
+                return {"found": False, "updated": False, "entry_id": entry_id}
+            df = await asyncio.to_thread(table.to_pandas)
+            matches = df[df["entry_id"] == entry_id]
+            if matches.empty:
+                return {"found": False, "updated": False, "entry_id": entry_id}
+
+            table_dim = self._get_table_dimension(table_name, table)
+            row = matches.iloc[0]
+            record = self._row_to_record(
+                row,
+                table_dim=table_dim,
+                updates=updates,
+                embedding=embedding,
+            )
+            where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
+
+            update_values = {k: record[k] for k in allowed if k in updates}
+            if embedding is not None:
+                update_values["vector"] = record["vector"]
+            try:
+                await asyncio.to_thread(
+                    lambda: table.update(where=where, values=update_values)
+                )
+                updated = await self.get_entry(table_name, entry_id)
+                if updated is not None:
+                    return {
+                        "found": True,
+                        "updated": True,
+                        "entry_id": entry_id,
+                        "method": "update",
+                    }
+            except Exception:
+                return {
+                    "found": True,
+                    "updated": False,
+                    "entry_id": entry_id,
+                    "error": "table_update_failed",
+                }
+            return {
+                "found": True,
+                "updated": False,
+                "entry_id": entry_id,
+                "error": "table_update_not_applied",
+            }
+        except Exception as e:
+            print(f"Update entry error: {e}")
+            return {
+                "found": True,
+                "updated": False,
+                "entry_id": entry_id,
+                "error": str(e),
+            }
 
     async def count_entries(self, table_name: str) -> int:
         """Count entries in a user's table"""
