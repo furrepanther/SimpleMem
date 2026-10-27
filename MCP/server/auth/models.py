@@ -5,6 +5,7 @@ Data models for authentication
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
+import hashlib
 import uuid
 
 
@@ -17,11 +18,14 @@ class User:
     table_name: str = ""
     created_at: datetime = field(default_factory=datetime.utcnow)
     last_active: datetime = field(default_factory=datetime.utcnow)
+    token_version: int = 0
 
     def __post_init__(self):
         if not self.table_name:
             # Generate unique table name for this user
             safe_id = self.user_id.replace("-", "_")
+            if safe_id != self.user_id:
+                safe_id = f"{safe_id}_{hashlib.sha256(self.user_id.encode()).hexdigest()[:12]}"
             self.table_name = f"mem_{safe_id}"
 
     def to_dict(self) -> dict:
@@ -31,6 +35,7 @@ class User:
             "table_name": self.table_name,
             "created_at": self.created_at.isoformat(),
             "last_active": self.last_active.isoformat(),
+            "token_version": self.token_version,
         }
 
     @classmethod
@@ -41,6 +46,7 @@ class User:
             table_name=data["table_name"],
             created_at=datetime.fromisoformat(data["created_at"]),
             last_active=datetime.fromisoformat(data["last_active"]),
+            token_version=int(data.get("token_version", 0)),
         )
 
 
@@ -52,6 +58,7 @@ class TokenPayload:
     table_name: str
     created_at: str
     exp: int  # Expiration timestamp
+    token_version: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -59,6 +66,7 @@ class TokenPayload:
             "table_name": self.table_name,
             "created_at": self.created_at,
             "exp": self.exp,
+            "token_version": self.token_version,
         }
 
     @classmethod
@@ -68,6 +76,7 @@ class TokenPayload:
             table_name=data["table_name"],
             created_at=data["created_at"],
             exp=data["exp"],
+            token_version=int(data.get("token_version", 0)),
         )
 
 

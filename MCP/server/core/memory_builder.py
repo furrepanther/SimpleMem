@@ -9,15 +9,16 @@ Converts raw dialogues into atomic memory entries through:
 Simplified: Direct processing without buffering.
 """
 
+import json
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 from ..auth.models import MemoryEntry, Dialogue
 from ..database.vector_store import MultiTenantVectorStore
 
-# Type alias for LLM client (supports both OpenRouter and Ollama)
-LLMClient = object  # Duck-typed: can be OpenRouterClient or OllamaClient
+# Type alias for LLM client (duck-typed OpenRouter-compatible client).
+LLMClient = object  # Duck-typed: OpenRouter-compatible client
 
 
 class MemoryBuilder:
@@ -34,6 +35,8 @@ class MemoryBuilder:
         window_size: int = 40,  # Max dialogues per LLM call
         overlap_size: int = 2,
         temperature: float = 0.1,
+        max_retries: int = 3,
+        entry_id_namespace: str = "",
     ):
         self.client = llm_client
         self.vector_store = vector_store
@@ -41,6 +44,8 @@ class MemoryBuilder:
         self.window_size = window_size
         self.overlap_size = overlap_size
         self.temperature = temperature
+        self.max_retries = max(1, int(max_retries))
+        self.entry_id_namespace = str(entry_id_namespace or "").strip()
 
         # Context from previous processing for deduplication
         self._previous_context: str = ""
@@ -69,7 +74,7 @@ class MemoryBuilder:
             dialogue_id=self._total_processed + 1,
             speaker=speaker,
             content=content,
-            timestamp=timestamp or datetime.utcnow().isoformat(),
+            timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
         )
 
         # Process immediately
@@ -129,18 +134,21 @@ class MemoryBuilder:
         # Convert to Dialogue objects
         dialogue_objects = []
         for i, dlg in enumerate(dialogues):
-            dialogue_objects.append(Dialogue(
-                dialogue_id=self._total_processed + i + 1,
-                speaker=dlg.get("speaker", ""),
-                content=dlg.get("content", ""),
-                timestamp=dlg.get("timestamp") or datetime.utcnow().isoformat(),
-            ))
+            dialogue_objects.append(
+                Dialogue(
+                    dialogue_id=self._total_processed + i + 1,
+                    speaker=dlg.get("speaker", ""),
+                    content=dlg.get("content", ""),
+                    timestamp=dlg.get("timestamp")
+                    or datetime.now(timezone.utc).isoformat(),
+                )
+            )
 
         total_entries = 0
 
         # Process in windows if too many dialogues
         for i in range(0, len(dialogue_objects), self.window_size):
-            window = dialogue_objects[i:i + self.window_size]
+            window = dialogue_objects[i : i + self.window_size]
 
             entries = await self._generate_memory_entries(window)
 
@@ -201,7 +209,8 @@ class MemoryBuilder:
         ]
 
         # Retry mechanism
-        max_retries = 3
+        max_retries = self.max_retries
+        last_error: Exception | None = None
         for attempt in range(max_retries):
             try:
                 response = await self.client.chat_completion(
@@ -213,32 +222,82 @@ class MemoryBuilder:
                 # Parse response
                 data = self.client.extract_json(response)
                 if data is None:
+                    last_error = ValueError("memory extraction response was not JSON")
                     continue
 
-                # Handle both list and dict with "entries" key
-                entries_data = data if isinstance(data, list) else data.get("entries", [])
+                # Accept only the documented list or {"entries": [...]} shape.
+                if isinstance(data, list):
+                    entries_data = data
+                elif isinstance(data, dict) and isinstance(data.get("entries"), list):
+                    entries_data = data["entries"]
+                else:
+                    last_error = ValueError(
+                        "memory extraction response missing an entries list"
+                    )
+                    continue
+
+                if any(
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("lossless_restatement"), str)
+                    or not item.get("lossless_restatement", "").strip()
+                    for item in entries_data
+                ):
+                    last_error = ValueError(
+                        "memory extraction response contains an invalid entry"
+                    )
+                    continue
 
                 entries = []
+                fingerprint_counts: dict[str, int] = {}
                 for item in entries_data:
-                    entry = MemoryEntry(
-                        entry_id=str(uuid.uuid4()),
-                        lossless_restatement=item.get("lossless_restatement", ""),
-                        keywords=item.get("keywords", []),
-                        timestamp=item.get("timestamp"),
-                        location=item.get("location"),
-                        persons=item.get("persons", []),
-                        entities=item.get("entities", []),
-                        topic=item.get("topic"),
+                    lossless_restatement = item["lossless_restatement"]
+                    persisted_fields = {
+                        "lossless_restatement": lossless_restatement,
+                        "keywords": item.get("keywords", []) or [],
+                        "timestamp": item.get("timestamp"),
+                        "location": item.get("location"),
+                        "persons": item.get("persons", []) or [],
+                        "entities": item.get("entities", []) or [],
+                        "topic": item.get("topic"),
+                    }
+                    if self.entry_id_namespace:
+                        entry_fingerprint = json.dumps(
+                            persisted_fields,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        occurrence = fingerprint_counts.get(entry_fingerprint, 0)
+                        fingerprint_counts[entry_fingerprint] = occurrence + 1
+                        dialogue_ids = ",".join(
+                            str(dialogue.dialogue_id) for dialogue in dialogues
+                        )
+                        entry_id = str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"{self.entry_id_namespace}:{dialogue_ids}:"
+                                f"{entry_fingerprint}:{occurrence}",
+                            )
+                        )
+                    else:
+                        entry_id = str(uuid.uuid4())
+                    entries.append(
+                        MemoryEntry(entry_id=entry_id, **persisted_fields)
                     )
-                    if entry.lossless_restatement:
-                        entries.append(entry)
 
                 return entries
 
             except Exception as e:
+                last_error = e
                 print(f"Memory extraction attempt {attempt + 1} failed: {e}")
-                if attempt == max_retries - 1:
-                    return []
+
+        if last_error is not None:
+            raise RuntimeError(
+                f"memory extraction failed after {max_retries} attempts"
+            ) from last_error
+        raise RuntimeError(
+            f"memory extraction returned no usable response after {max_retries} attempts"
+        )
 
         return []
 
