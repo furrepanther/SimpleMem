@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import httpx
+
 from .auth.models import User, MemoryEntry
 from .core.answer_generator import AnswerGenerator
 from .core.memory_builder import MemoryBuilder
@@ -56,6 +58,10 @@ class JsonRpcResponse:
 MCP_VERSION = "2025-03-26"
 SERVER_NAME = "simplemem"
 SERVER_VERSION = "1.0.0"
+
+
+class MemoryBackendUnavailable(RuntimeError):
+    """Configured shared retrieval is incomplete; callers must retry."""
 
 
 class MCPHandler:
@@ -759,13 +765,28 @@ class MCPHandler:
             )
             response.raise_for_status()
             payload = response.json()
-        except Exception as exc:
-            logging.getLogger(__name__).warning("fastpath_error: %s", exc)
-            return None
+        except httpx.HTTPStatusError as exc:
+            error = "memory_backend_unavailable"
+            try:
+                body = exc.response.json()
+            except ValueError:
+                body = None
+            detail = body.get("detail") if isinstance(body, dict) else None
+            if isinstance(detail, dict) and detail.get("error") == "semantic_refresh_pending":
+                error = "semantic_refresh_pending"
+            logging.getLogger(__name__).warning("fastpath_unavailable: HTTP %s", exc.response.status_code)
+            raise MemoryBackendUnavailable(error) from exc
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            logging.getLogger(__name__).warning("fastpath_unavailable: %s", type(exc).__name__)
+            raise MemoryBackendUnavailable("memory_backend_unavailable") from exc
 
+        if not isinstance(payload, dict):
+            raise MemoryBackendUnavailable("memory_backend_unavailable")
+        if payload.get("search_mode") == "semantic_refresh_pending":
+            raise MemoryBackendUnavailable("semantic_refresh_pending")
         rows = payload.get("results")
-        if not isinstance(rows, list):
-            return None
+        if payload.get("gated") or not isinstance(rows, list):
+            raise MemoryBackendUnavailable("memory_backend_unavailable")
         flat_rows = _iter_rows(rows)
 
         return {
@@ -1632,7 +1653,16 @@ class MCPHandler:
         handler = handlers.get(name)
         if not handler:
             raise ValueError(f"Unknown tool: {name}")
-        result = await handler(arguments)
+        try:
+            result = await handler(arguments)
+        except MemoryBackendUnavailable as exc:
+            return {
+                "isError": True,
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({"error": str(exc), "retryable": True, "gated": True}),
+                }],
+            }
         return {
             "content": [
                 {
