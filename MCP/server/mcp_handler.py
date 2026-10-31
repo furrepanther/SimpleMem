@@ -2101,6 +2101,8 @@ class MCPHandler:
             return result
         except Exception as exc:
             owner_future.set_exception(exc)
+            # The owner raises directly; coalesced waiters still await this error.
+            owner_future.exception()
             raise
         finally:
             current = MCPHandler._retrieve_inflight.get(cache_key)

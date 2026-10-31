@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import json
 from types import SimpleNamespace
 
@@ -135,4 +136,32 @@ def test_coalesced_callers_all_receive_pending_and_recover_without_empty_cache()
             assert all(r.get("isError") and json.loads(r["content"][0]["text"])["retryable"] for r in results)
             assert not MCPHandler._retrieve_cache and not MCPHandler._retrieve_negative_cache
             assert not MCPHandler._retrieve_inflight
+    asyncio.run(run())
+
+
+def test_actual_jsonrpc_pending_and_recovery_leave_no_unhandled_owner_future():
+    async def run():
+        state = ["pending503"]
+        unhandled = []
+        loop = asyncio.get_running_loop()
+        original = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, context: unhandled.append(context))
+        try:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: backend_response(state[0], r))) as client:
+                handler = make_handler(client)
+                handler.initialized = True
+                request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_retrieve", "arguments": {"query": "actual wire error and recovery"}}}
+                pending = json.loads(await handler.handle_message(json.dumps(request)))
+                assert pending["result"]["isError"]
+                assert json.loads(pending["result"]["content"][0]["text"])["retryable"]
+                state[0] = "healthy_empty"
+                request["id"] = 2
+                recovered = json.loads(await handler.handle_message(json.dumps(request)))
+                assert not recovered["result"].get("isError")
+                assert json.loads(recovered["result"]["content"][0]["text"])["total"] == 0
+                gc.collect()
+                await asyncio.sleep(0)
+                assert not unhandled
+        finally:
+            loop.set_exception_handler(original)
     asyncio.run(run())
