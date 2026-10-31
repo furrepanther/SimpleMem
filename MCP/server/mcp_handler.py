@@ -785,7 +785,7 @@ class MCPHandler:
         if payload.get("search_mode") == "semantic_refresh_pending":
             raise MemoryBackendUnavailable("semantic_refresh_pending")
         rows = payload.get("results")
-        if payload.get("gated") or not isinstance(rows, list):
+        if payload.get("gated") or payload.get("status", "ok") != "ok" or not isinstance(rows, list):
             raise MemoryBackendUnavailable("memory_backend_unavailable")
         flat_rows = _iter_rows(rows)
 

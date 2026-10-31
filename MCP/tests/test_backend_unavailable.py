@@ -49,10 +49,14 @@ def backend_response(case, request):
         return httpx.Response(200, json={"results": [], "search_mode": "semantic_refresh_pending", "gated": True})
     if case == "gated200":
         return httpx.Response(200, json={"results": [], "gated": True})
+    if case == "degraded_empty200":
+        return httpx.Response(200, json={"results": [], "status": "degraded"})
+    if case == "degraded_partial200":
+        return httpx.Response(200, json={"results": [{"entry_id": "partial", "content": "incomplete backend context"}], "status": "degraded"})
     return httpx.Response(200, json={"results": [], "total_available": 0})
 
 
-@pytest.mark.parametrize("case", ["pending503", "error503", "unreachable", "invalid_json", "not_object", "missing_results", "pending200", "gated200"])
+@pytest.mark.parametrize("case", ["pending503", "error503", "unreachable", "invalid_json", "not_object", "missing_results", "pending200", "gated200", "degraded_empty200", "degraded_partial200"])
 @pytest.mark.parametrize("force_exact", [False, True])
 def test_backend_failure_is_retryable_tool_error_never_cached_as_empty(case, force_exact):
     async def run():
