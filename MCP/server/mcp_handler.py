@@ -1541,6 +1541,11 @@ class MCPHandler:
                                 "description": "Optional; ignored in authenticated mode",
                             },
                             "query": {"type": "string"},
+                            "force_exact": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": "Resolve query as an exact memory or entry ID; return no semantic substitutes on a miss.",
+                            },
                             "limit": {
                                 "type": "integer",
                                 "description": "Alias of top_k",
@@ -1981,7 +1986,9 @@ class MCPHandler:
                 max(1, int(self.settings.memory_retrieve_max_top_k)),
             ),
         )
-        force_exact = bool(args.get("force_exact", False))
+        force_exact = args.get("force_exact", False)
+        if not isinstance(force_exact, bool):
+            raise ValueError("memory_retrieve force_exact must be a boolean")
         retrieve_cache_ttl_ms = int(
             getattr(self.settings, "memory_retrieve_result_cache_ttl_ms", 2000)
         )

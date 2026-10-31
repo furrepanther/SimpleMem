@@ -1,6 +1,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from server.auth.models import MemoryEntry
 from server.mcp_handler import MCPHandler
 
@@ -88,3 +90,83 @@ def test_exact_retrieval_returns_empty_on_backend_miss() -> None:
     )
 
     assert result == {"query": target_id, "results": [], "total": 0}
+
+
+def _retrieval_handler() -> MCPHandler:
+    MCPHandler._invalidate_memory_caches()
+    handler = object.__new__(MCPHandler)
+    handler.user = SimpleNamespace(user_id="global", table_name="mem_global")
+    handler.settings = SimpleNamespace(
+        memory_retrieve_max_query_chars=4096,
+        memory_retrieve_max_top_k=10,
+    )
+    return handler
+
+
+def test_mcp_schema_exposes_the_supported_exact_lookup_option() -> None:
+    handler = object.__new__(MCPHandler)
+    listing = asyncio.run(handler._handle_tools_list({}))
+    tool = next(item for item in listing["tools"] if item["name"] == "memory_retrieve")
+    option = tool["inputSchema"]["properties"]["force_exact"]
+
+    assert option["type"] == "boolean"
+    assert option["default"] is False
+
+
+def test_public_exact_lookup_returns_local_entry_without_semantic_search() -> None:
+    target_id = "6426df95-a1ab-5d95-adf9-394f12dcc084"
+    entry = MemoryEntry(entry_id=target_id, lossless_restatement="exact canary")
+
+    class Store:
+        async def get_entry(self, table_name: str, entry_id: str):
+            assert (table_name, entry_id) == ("mem_global", target_id)
+            return entry
+
+    handler = _retrieval_handler()
+    handler.vector_store = Store()
+
+    def reject_semantic_search():
+        raise AssertionError("exact lookup entered the semantic retrieval path")
+
+    handler._get_retriever = reject_semantic_search
+    result = asyncio.run(
+        handler._tool_memory_retrieve({"query": target_id, "force_exact": True})
+    )
+
+    assert result["total"] == 1
+    assert result["results"][0]["entry_id"] == target_id
+    assert result["results"][0]["content"] == "exact canary"
+
+
+def test_default_lookup_preserves_semantic_merge_order() -> None:
+    entry = MemoryEntry(entry_id="local-semantic", lossless_restatement="local fact")
+
+    class Retriever:
+        async def retrieve(self, **kwargs):
+            assert kwargs["query"] == "semantic query"
+            return [entry]
+
+    handler = _retrieval_handler()
+    handler._get_retriever = lambda: Retriever()
+
+    async def fastpath(**kwargs):
+        assert kwargs["force_exact"] is False
+        return {"results": [{"entry_id": "backend-semantic", "content": "backend fact"}]}
+
+    handler._memory_retrieve_fastpath = fastpath
+    result = asyncio.run(handler._tool_memory_retrieve({"query": "semantic query"}))
+
+    assert [row["entry_id"] for row in result["results"]] == [
+        "local-semantic",
+        "backend-semantic",
+    ]
+
+
+@pytest.mark.parametrize("invalid", ["false", "true", 0, 1, None, []])
+def test_exact_lookup_rejects_nonboolean_flags(invalid) -> None:
+    handler = _retrieval_handler()
+
+    with pytest.raises(ValueError, match="force_exact must be a boolean"):
+        asyncio.run(
+            handler._tool_memory_retrieve({"query": "target", "force_exact": invalid})
+        )
