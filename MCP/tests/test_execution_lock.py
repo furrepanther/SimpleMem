@@ -1037,6 +1037,10 @@ def test_reopening_queue_backfills_legacy_checkpoint_and_raw_entry_guards(tmp_pa
         store.close()
     reopened = DurableJobStore(db)
     try:
+        assert not reopened.has_pending_entry("t", "legacy-id")
+        with reopened.execution_locks.try_service() as acquired:
+            assert acquired
+            reopened._backfill_replayable_entries()
         raw_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"simplemem:fixture:{raw}:raw"))
         assert reopened.has_pending_entry("t", "legacy-id")
         assert reopened.has_pending_entry("t", raw_id)
@@ -1056,8 +1060,73 @@ def test_invalid_retained_checkpoint_fails_closed_without_deleting_job(tmp_path)
             store._get_connection().execute("INSERT INTO durable_job_checkpoints(job_id, window_index, input_hash, entries_json) VALUES (?, 0, 'fixture', ?)", (job_id, "not-json"))
     finally:
         store.close()
-    with pytest.raises(CheckpointIntegrityError, match="invalid retained checkpoint"):
-        DurableJobStore(db)
+    reopened = DurableJobStore(db)
+    try:
+        with reopened.execution_locks.try_service() as acquired:
+            assert acquired
+            with pytest.raises(CheckpointIntegrityError, match="invalid retained checkpoint"):
+                reopened._backfill_replayable_entries()
+    finally:
+        reopened.close()
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT status FROM durable_jobs WHERE job_id = ?", (job_id,)).fetchone()[0] == "processing"
         assert conn.execute("SELECT entries_json FROM durable_job_checkpoints WHERE job_id = ?", (job_id,)).fetchone()[0] == "not-json"
+
+
+def test_non_owner_cannot_backfill_before_service_lock(tmp_path):
+    import subprocess
+    import sys
+    from server.database.durable_job_store import DurableJobStore
+
+    db = str(tmp_path / "queue.sqlite")
+    owner = DurableJobStore(db)
+    try:
+        job_id = owner.enqueue_or_get(user_id="fixture", kind="memory_add", idempotency_key="key", payload={"user_id": "fixture", "table_name": "t"}, max_inflight_writes=10)["job_id"]
+        with owner.claim_locked_batch(worker_id="old", batch_size=1, lease_seconds=5):
+            owner.save_checkpoint(job_id=job_id, lease_owner="old", window_index=0, input_hash="fixture", entries=[{"entry_id": "legacy-id"}])
+        child = """
+import sys
+from types import SimpleNamespace
+from server.mcp_handler import MCPHandler
+settings = SimpleNamespace(durable_queue_db_path=sys.argv[1], memory_write_max_retries=6)
+try:
+    MCPHandler._initialize_durable_runtime(settings)
+except RuntimeError as exc:
+    if str(exc) != 'simplemem_service_already_running_for_queue': raise
+    print('service-lock-denied')
+else:
+    print('service-lock-acquired')
+"""
+        with owner.execution_locks.try_service() as acquired:
+            assert acquired
+            result = subprocess.run([sys.executable, "-c", child, db], check=True, capture_output=True, text=True)
+            assert result.stdout.strip() == "service-lock-denied"
+            assert not owner.has_pending_entry("t", "legacy-id")
+        result = subprocess.run([sys.executable, "-c", child, db], check=True, capture_output=True, text=True)
+        assert result.stdout.strip() == "service-lock-acquired"
+        assert owner.has_pending_entry("t", "legacy-id")
+    finally:
+        owner.close()
+
+
+def test_backfill_failure_releases_service_ownership(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from server.database.durable_job_store import CheckpointIntegrityError, DurableJobStore
+    from server.mcp_handler import MCPHandler
+
+    db = str(tmp_path / "queue.sqlite")
+    store = DurableJobStore(db)
+    job_id = store.enqueue_or_get(user_id="fixture", kind="memory_add", idempotency_key="key", payload={"user_id": "fixture", "table_name": "t"}, max_inflight_writes=10)["job_id"]
+    store._get_connection().execute("INSERT INTO durable_job_checkpoints(job_id, window_index, input_hash, entries_json) VALUES (?, 0, 'fixture', ?)", (job_id, "not-json"))
+    monkeypatch.setattr(MCPHandler, "_durable_store", None)
+    monkeypatch.setattr(MCPHandler, "_service_lock_guard", None)
+    try:
+        with pytest.raises(CheckpointIntegrityError):
+            MCPHandler._initialize_durable_runtime(SimpleNamespace(durable_queue_db_path=db, memory_write_max_retries=6))
+        assert MCPHandler._durable_store is None
+        assert MCPHandler._service_lock_guard is None
+        with store.execution_locks.try_service() as acquired:
+            assert acquired
+        assert store.get_job(job_id=job_id)["status"] == "pending"
+    finally:
+        store.close()

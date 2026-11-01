@@ -54,7 +54,6 @@ class DurableJobStore:
             os.makedirs(parent, exist_ok=True)
         self._init_db()
         self.execution_locks = JobExecutionLocks(db_path, self._get_connection())
-        self._backfill_replayable_entries()
 
     def _backfill_replayable_entries(self) -> None:
         """Index retained unfinished checkpoints before deletion can be served."""

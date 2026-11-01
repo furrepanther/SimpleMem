@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from collections import deque
@@ -74,6 +75,7 @@ class MCPHandler:
 
     _durable_store: Optional[DurableJobStore] = None
     _service_lock_guard: Optional[Any] = None
+    _durable_initialization_lock = threading.Lock()
     _shared_settings: Optional[Any] = None
     _shared_vector_store: Optional[MultiTenantVectorStore] = None
     _shared_client_manager: Optional[ClientManager] = None
@@ -205,15 +207,38 @@ class MCPHandler:
             MCPHandler._shared_client_manager = client_manager
         if MCPHandler._shared_settings is None:
             MCPHandler._shared_settings = settings
-        if MCPHandler._durable_store is None:
-            MCPHandler._durable_store = DurableJobStore(settings.durable_queue_db_path)
-            MCPHandler._lease_recoveries += (
-                MCPHandler._durable_store.recover_expired_leases(
-                    max_retries=max(1, int(settings.memory_write_max_retries))
-                )
-            )
+        MCPHandler._initialize_durable_runtime(settings)
         if isinstance(vector_store, MultiTenantVectorStore):
             vector_store.set_pending_replay_checker(MCPHandler._durable_store.has_pending_entry)
+
+    @classmethod
+    def _initialize_durable_runtime(cls, settings: Any) -> None:
+        """Own the service lock before migration, recovery, or serving requests."""
+        with cls._durable_initialization_lock:
+            if cls._service_lock_guard is not None:
+                return
+            created_store = cls._durable_store is None
+            store = cls._durable_store or DurableJobStore(settings.durable_queue_db_path)
+            guard = store.execution_locks.try_service()
+            entered = False
+            try:
+                acquired = guard.__enter__()
+                entered = True
+                if not acquired:
+                    raise RuntimeError("simplemem_service_already_running_for_queue")
+                store._backfill_replayable_entries()
+                recovered = store.recover_expired_leases(
+                    max_retries=max(1, int(settings.memory_write_max_retries))
+                )
+            except BaseException:
+                if entered:
+                    guard.__exit__(None, None, None)
+                if created_store:
+                    store.close()
+                raise
+            cls._durable_store = store
+            cls._service_lock_guard = guard
+            cls._lease_recoveries += recovered
 
     @classmethod
     async def start_background_workers(
@@ -235,19 +260,9 @@ class MCPHandler:
                 cls._shared_user_store = user_store
             if token_manager is not None:
                 cls._shared_token_manager = token_manager
-            if cls._durable_store is None:
-                cls._durable_store = DurableJobStore(settings.durable_queue_db_path)
+            cls._initialize_durable_runtime(settings)
             if isinstance(vector_store, MultiTenantVectorStore):
                 vector_store.set_pending_replay_checker(cls._durable_store.has_pending_entry)
-            if cls._service_lock_guard is None:
-                guard = cls._durable_store.execution_locks.try_service()
-                if not guard.__enter__():
-                    guard.__exit__(None, None, None)
-                    raise RuntimeError("simplemem_service_already_running_for_queue")
-                cls._service_lock_guard = guard
-            cls._lease_recoveries += cls._durable_store.recover_expired_leases(
-                max_retries=max(1, int(settings.memory_write_max_retries))
-            )
             if cls._worker_shutdown is None:
                 cls._worker_shutdown = asyncio.Event()
             cls._worker_shutdown.clear()
@@ -284,9 +299,10 @@ class MCPHandler:
             if cls._shared_fastpath_client is not None:
                 await cls._shared_fastpath_client.aclose()
                 cls._shared_fastpath_client = None
-            if cls._service_lock_guard is not None:
-                cls._service_lock_guard.__exit__(None, None, None)
-                cls._service_lock_guard = None
+            with cls._durable_initialization_lock:
+                if cls._service_lock_guard is not None:
+                    cls._service_lock_guard.__exit__(None, None, None)
+                    cls._service_lock_guard = None
 
     @classmethod
     async def _durable_retention_loop(cls) -> None:
