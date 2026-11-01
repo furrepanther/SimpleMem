@@ -213,14 +213,6 @@ class Settings:
             )
         )
     )
-    memory_query_synthesis_timeout_ms: int = field(
-        default_factory=lambda: int(
-            os.getenv(
-                "MEMORY_QUERY_SYNTHESIS_TIMEOUT_MS",
-                "4500",
-            )
-        )
-    )
     memory_query_answer_max_tokens: int = field(
         default_factory=lambda: int(
             os.getenv(
@@ -543,9 +535,6 @@ class Settings:
         self.memory_query_max_context_total_chars = max(
             self.memory_query_max_context_entry_chars,
             int(self.memory_query_max_context_total_chars),
-        )
-        self.memory_query_synthesis_timeout_ms = max(
-            250, int(self.memory_query_synthesis_timeout_ms)
         )
         self.rerank_candidate_cap = max(2, int(self.rerank_candidate_cap))
         self.rerank_document_max_chars = max(256, int(self.rerank_document_max_chars))

@@ -3,10 +3,15 @@ Data models for authentication
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 import hashlib
 import uuid
+
+
+def _naive_utc_now() -> datetime:
+    """Preserve the existing naive-UTC serialization contract."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 @dataclass
@@ -16,8 +21,8 @@ class User:
     user_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     openrouter_api_key_encrypted: str = ""
     table_name: str = ""
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    last_active: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_naive_utc_now)
+    last_active: datetime = field(default_factory=_naive_utc_now)
     token_version: int = 0
 
     def __post_init__(self):

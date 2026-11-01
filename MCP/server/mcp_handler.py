@@ -1926,32 +1926,7 @@ class MCPHandler:
             )
             contexts = contexts[:top_k]
 
-            synthesis_timeout_s = max(
-                0.25,
-                float(getattr(self.settings, "memory_query_synthesis_timeout_ms", 4500))
-                / 1000.0,
-            )
-            try:
-                answer_result = await asyncio.wait_for(
-                    generator.generate_answer(query=question, contexts=contexts),
-                    timeout=synthesis_timeout_s,
-                )
-            except asyncio.TimeoutError:
-                snippets = [
-                    str(e.lossless_restatement or "").strip()
-                    for e in contexts[:3]
-                    if str(e.lossless_restatement or "").strip()
-                ]
-                fallback = (
-                    " | ".join(snippets)
-                    if snippets
-                    else "Timed out while synthesizing answer."
-                )
-                answer_result = {
-                    "answer": fallback[:700],
-                    "reasoning": f"Fallback summary from memory_retrieve contexts after synthesis timeout ({synthesis_timeout_s:.2f}s).",
-                    "confidence": "low",
-                }
+            answer_result = await generator.generate_answer(query=question, contexts=contexts)
             answer_text = str(answer_result.get("answer", ""))
             reasoning_text = str(answer_result.get("reasoning", ""))
             if "error occurred while generating the answer" in answer_text.lower():
@@ -1984,8 +1959,12 @@ class MCPHandler:
                 )
             owner_future.set_result(dict(result))
             return result
+        except asyncio.CancelledError:
+            owner_future.cancel()
+            raise
         except Exception as exc:
             owner_future.set_exception(exc)
+            owner_future.exception()
             raise
         finally:
             current = MCPHandler._query_inflight.get(cache_key)

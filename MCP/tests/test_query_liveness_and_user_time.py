@@ -1,0 +1,152 @@
+import asyncio
+import warnings
+from datetime import datetime
+from types import SimpleNamespace
+
+import pytest
+
+from server.auth.models import MemoryEntry, User
+from server.core.answer_generator import AnswerGenerator
+from server.core.retriever import Retriever
+from server.database.vector_store import MultiTenantVectorStore
+from server.mcp_handler import MCPHandler
+
+
+def make_handler(generator):
+    MCPHandler._invalidate_memory_caches()
+    handler = object.__new__(MCPHandler)
+    handler.user = SimpleNamespace(user_id="query-fixture", table_name="mem_fixture")
+    handler.settings = SimpleNamespace(
+        memory_query_max_question_chars=4096,
+        memory_query_default_top_k=3,
+        memory_query_max_top_k=5,
+        memory_query_synthesis_timeout_ms=250,
+        enable_reflection=False,
+        enable_planning=False,
+        memory_queue_max_inflight_reads=2,
+    )
+
+    async def retrieve(**kwargs):
+        return [MemoryEntry(entry_id="fixture", lossless_restatement="A local fact.")]
+
+    handler._get_retriever = lambda: SimpleNamespace(retrieve=retrieve)
+    handler._get_answer_generator = lambda: generator
+    return handler
+
+
+def test_query_does_not_cancel_synthesis_after_former_timeout():
+    async def exercise():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def generate_answer(**kwargs):
+            started.set()
+            await release.wait()
+            return {"answer": "Completed answer.", "reasoning": "fixture", "confidence": "high"}
+
+        handler = make_handler(SimpleNamespace(generate_answer=generate_answer))
+        task = asyncio.create_task(handler._tool_memory_query({"question": "slow fixture"}))
+        await started.wait()
+        await asyncio.sleep(0.35)  # Exceeds the prior fixture setting; never terminates a job.
+        assert not task.done(), "duration alone completed or cancelled synthesis"
+        release.set()
+        result = await task
+        assert result["answer"] == "Completed answer."
+        assert result["confidence"] == "high"
+
+    asyncio.run(exercise())
+
+
+def test_query_owner_disconnect_cancels_coalesced_waiter_without_cache():
+    async def exercise():
+        started = asyncio.Event()
+
+        async def generate_answer(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        handler = make_handler(SimpleNamespace(generate_answer=generate_answer))
+        owner = asyncio.create_task(handler._tool_memory_query({"question": "disconnect fixture"}))
+        await started.wait()
+        waiter = asyncio.create_task(handler._tool_memory_query({"question": "disconnect fixture"}))
+        await asyncio.sleep(0)
+        owner.cancel()  # Simulate an explicit caller disconnect, not an elapsed-time limit.
+        outcomes = await asyncio.gather(owner, waiter, return_exceptions=True)
+        assert all(isinstance(item, asyncio.CancelledError) for item in outcomes)
+        assert not MCPHandler._query_inflight
+        assert not MCPHandler._query_cache
+
+    asyncio.run(exercise())
+
+
+def test_query_propagates_generator_failure_without_cache_or_unhandled_future():
+    async def exercise():
+        import gc
+
+        events = []
+        loop = asyncio.get_running_loop()
+        old_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, context: events.append(context))
+
+        async def generate_answer(**kwargs):
+            raise RuntimeError("fixture upstream failure")
+
+        try:
+            handler = make_handler(SimpleNamespace(generate_answer=generate_answer))
+            with pytest.raises(RuntimeError, match="fixture upstream failure"):
+                await handler._tool_memory_query({"question": "failure fixture"})
+            gc.collect()
+            await asyncio.sleep(0)
+            assert not MCPHandler._query_cache
+            assert not MCPHandler._query_inflight
+            assert not events
+        finally:
+            loop.set_exception_handler(old_handler)
+
+    asyncio.run(exercise())
+
+
+def test_query_uses_local_lancedb_hit_and_empty_controls(tmp_path):
+    async def exercise():
+        class FakeEmbedding:
+            async def create_single_embedding(self, *args, **kwargs):
+                return [1.0, 0.0]
+
+        async def generate_answer(query, contexts):
+            assert [item.entry_id for item in contexts] == ["fixture"]
+            return {"answer": contexts[0].lossless_restatement, "confidence": "high"}
+
+        store = MultiTenantVectorStore(str(tmp_path / "lancedb"), embedding_dimension=2)
+        entry = MemoryEntry(entry_id="fixture", lossless_restatement="A local fact.")
+        assert await store.add_entries("mem_hit", [entry], [[1.0, 0.0]]) == 1
+        retriever = Retriever(FakeEmbedding(), store, "mem_hit", enable_planning=False, enable_reflection=False, enable_reranking=False)
+        handler = make_handler(SimpleNamespace(generate_answer=generate_answer))
+        handler._get_retriever = lambda: retriever
+        hit = await handler._tool_memory_query({"question": "hit fixture"})
+        assert hit["answer"] == "A local fact." and hit["contexts_used"] == 1
+
+        empty_retriever = Retriever(FakeEmbedding(), store, "mem_empty", enable_planning=False, enable_reflection=False, enable_reranking=False)
+        handler._get_retriever = lambda: empty_retriever
+        handler._get_answer_generator = lambda: AnswerGenerator(FakeEmbedding())
+        empty = await handler._tool_memory_query({"question": "empty fixture"})
+        assert empty["contexts_used"] == 0 and empty["confidence"] == "low"
+        assert empty["answer"] == "I don't have any relevant memories to answer this question."
+
+    asyncio.run(exercise())
+
+
+def test_user_defaults_preserve_naive_utc_and_legacy_roundtrip_without_warning():
+    legacy = {
+        "user_id": "legacy-fixture",
+        "openrouter_api_key_encrypted": "",
+        "table_name": "mem_legacy",
+        "created_at": "2026-10-01T12:00:00",
+        "last_active": "2026-10-01T12:01:00",
+        "token_version": 0,
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        created = User(user_id="new-fixture")
+    assert created.created_at.tzinfo is None and created.last_active.tzinfo is None
+    assert datetime.fromisoformat(created.to_dict()["created_at"]).tzinfo is None
+    assert User.from_dict(legacy).to_dict() == legacy
