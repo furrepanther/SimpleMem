@@ -143,7 +143,7 @@ def test_coalesced_callers_all_receive_pending_and_recover_without_empty_cache()
     asyncio.run(run())
 
 
-def test_actual_jsonrpc_pending_and_recovery_leave_no_unhandled_owner_future():
+def test_actual_jsonrpc_pending_and_recovery_leave_no_unhandled_owner_future(deliver_ready_message):
     async def run():
         state = ["pending503"]
         unhandled = []
@@ -155,12 +155,12 @@ def test_actual_jsonrpc_pending_and_recovery_leave_no_unhandled_owner_future():
                 handler = make_handler(client)
                 handler.initialized = True
                 request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_retrieve", "arguments": {"query": "actual wire error and recovery"}}}
-                pending = json.loads(await handler.handle_message(json.dumps(request)))
+                pending = json.loads(await deliver_ready_message(handler, json.dumps(request)))
                 assert pending["result"]["isError"]
                 assert json.loads(pending["result"]["content"][0]["text"])["retryable"]
                 state[0] = "healthy_empty"
                 request["id"] = 2
-                recovered = json.loads(await handler.handle_message(json.dumps(request)))
+                recovered = json.loads(await deliver_ready_message(handler, json.dumps(request)))
                 assert not recovered["result"].get("isError")
                 assert json.loads(recovered["result"]["content"][0]["text"])["total"] == 0
                 gc.collect()

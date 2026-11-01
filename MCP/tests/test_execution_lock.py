@@ -1258,3 +1258,209 @@ def test_handler_is_not_exposed_during_failed_startup_or_after_shutdown(tmp_path
                 await MCPHandler.stop_background_workers()
             store.close()
     asyncio.run(scenario())
+
+
+def test_shutdown_fences_cached_handler_and_waits_for_admitted_request(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    from types import MethodType, SimpleNamespace
+    from server.database.durable_job_store import DurableJobStore
+    from server.mcp_handler import JsonRpcResponse, MCPHandler
+
+    async def scenario():
+        store = DurableJobStore(str(tmp_path / "queue.sqlite"))
+        observer = DurableJobStore(store.db_path)
+        settings = SimpleNamespace(memory_write_workers=1, memory_write_max_retries=6, memory_write_lease_seconds=90, memory_write_batch_max=1, memory_write_batch_max_wait_ms=10, memory_write_purge_interval_s=300, memory_write_retention_hours=24, memory_write_max_content_chars=8192, memory_write_max_payload_bytes=65536, memory_queue_max_inflight_writes=10, memory_queue_max_global_inflight_writes=10)
+        for name, value in (("_runtime_lock", None), ("_durable_store", store), ("_service_lock_guard", None), ("_durable_runtime_ready", False), ("_runtime_event_loop", None), ("_runtime_drained", None), ("_active_runtime_requests", 0), ("_worker_shutdown", None), ("_worker_tasks", []), ("_retention_task", None), ("_lease_recoveries", 0), ("_shared_fastpath_client", None)):
+            monkeypatch.setattr(MCPHandler, name, value)
+        entered, release = asyncio.Event(), asyncio.Event()
+        held = stop = None
+        try:
+            await MCPHandler.start_background_workers(settings=settings, vector_store=object(), client_manager=object())
+            handler = MCPHandler(user=SimpleNamespace(user_id="fixture", table_name="fixture"), api_key="fixture", vector_store=object(), client_manager=object(), settings=settings)
+            async def held_dispatch(self, request):
+                entered.set()
+                await release.wait()
+                return JsonRpcResponse(id=request.id, result={"ok": True})
+            handler._dispatch = MethodType(held_dispatch, handler)
+            held = asyncio.create_task(handler.handle_message(json.dumps({"jsonrpc":"2.0", "id":1, "method":"held"})))
+            await entered.wait()
+            stop = asyncio.create_task(MCPHandler.stop_background_workers())
+            await asyncio.sleep(0)
+            assert not stop.done() and not MCPHandler._durable_runtime_ready
+            with observer.execution_locks.try_service() as acquired:
+                assert not acquired
+            rejected = json.loads(await handler.handle_message(json.dumps({"jsonrpc":"2.0", "id":2, "method":"held"})))
+            assert rejected["error"]["message"] == "simplemem_durable_runtime_not_ready"
+            assert rejected["error"]["data"]["retryable"] is True
+            with pytest.raises(RuntimeError, match="simplemem_durable_runtime_not_ready"):
+                await handler._enqueue_durable(kind="memory_add", args={"content":"must not enqueue"})
+            assert store.queue_counts()["pending"] == 0
+            release.set()
+            assert json.loads(await held)["result"]["ok"] is True
+            await stop
+            with observer.execution_locks.try_service() as acquired:
+                assert acquired
+            rejected = json.loads(await handler.handle_message(json.dumps({"jsonrpc":"2.0", "id":3, "method":"held"})))
+            assert rejected["error"]["message"] == "simplemem_durable_runtime_not_ready"
+        finally:
+            release.set()
+            if held is not None:
+                await asyncio.gather(held, return_exceptions=True)
+            if stop is not None:
+                await asyncio.gather(stop, return_exceptions=True)
+            if MCPHandler._service_lock_guard is not None:
+                await MCPHandler.stop_background_workers()
+            store.close()
+            observer.close()
+    asyncio.run(scenario())
+
+
+def test_cancelled_admitted_request_releases_shutdown_drain(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    from types import MethodType, SimpleNamespace
+    from server.database.durable_job_store import DurableJobStore
+    from server.mcp_handler import MCPHandler
+
+    async def scenario():
+        store = DurableJobStore(str(tmp_path / "queue.sqlite"))
+        settings = SimpleNamespace(memory_write_workers=1, memory_write_max_retries=6, memory_write_lease_seconds=90, memory_write_batch_max=1, memory_write_batch_max_wait_ms=10, memory_write_purge_interval_s=300, memory_write_retention_hours=24)
+        for name, value in (("_runtime_lock", None), ("_durable_store", store), ("_service_lock_guard", None), ("_durable_runtime_ready", False), ("_runtime_event_loop", None), ("_runtime_drained", None), ("_active_runtime_requests", 0), ("_worker_shutdown", None), ("_worker_tasks", []), ("_retention_task", None), ("_lease_recoveries", 0), ("_shared_fastpath_client", None)):
+            monkeypatch.setattr(MCPHandler, name, value)
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            await MCPHandler.start_background_workers(settings=settings, vector_store=object(), client_manager=object())
+            handler = MCPHandler(user=object(), api_key="fixture", vector_store=object(), client_manager=object(), settings=settings)
+            async def held_dispatch(self, request):
+                entered.set()
+                await release.wait()
+            handler._dispatch = MethodType(held_dispatch, handler)
+            held = asyncio.create_task(handler.handle_message(json.dumps({"jsonrpc":"2.0", "id":1, "method":"held"})))
+            await entered.wait()
+            held.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await held
+            assert MCPHandler._active_runtime_requests == 0
+            await MCPHandler.stop_background_workers()
+            assert MCPHandler._service_lock_guard is None
+        finally:
+            release.set()
+            if MCPHandler._service_lock_guard is not None:
+                await MCPHandler.stop_background_workers()
+            store.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["table_open", "update_write"])
+def test_cancelled_update_keeps_service_owner_until_mutation_thread_exits(tmp_path, monkeypatch, phase):
+    import asyncio
+    import json
+    import threading
+    from types import MethodType, SimpleNamespace
+    from server.auth.models import MemoryEntry
+    from server.database.durable_job_store import DurableJobStore
+    from server.database.vector_store import MultiTenantVectorStore
+    from server.mcp_handler import JsonRpcResponse, MCPHandler
+
+    async def scenario():
+        store = DurableJobStore(str(tmp_path / "queue.sqlite"))
+        observer = DurableJobStore(store.db_path)
+        vector = MultiTenantVectorStore(db_path=str(tmp_path / "lance"), embedding_dimension=4)
+        await vector.add_entries("fixture", [MemoryEntry(entry_id="e", lossless_restatement="old")], [[0.1, 0.2, 0.3, 0.4]])
+        settings = SimpleNamespace(memory_write_workers=1, memory_write_max_retries=6, memory_write_lease_seconds=90, memory_write_batch_max=1, memory_write_batch_max_wait_ms=10, memory_write_purge_interval_s=300, memory_write_retention_hours=24)
+        for name, value in (("_runtime_lock", None), ("_durable_store", store), ("_service_lock_guard", None), ("_durable_runtime_ready", False), ("_runtime_event_loop", None), ("_runtime_drained", None), ("_active_runtime_requests", 0), ("_worker_shutdown", None), ("_worker_tasks", []), ("_retention_task", None), ("_lease_recoveries", 0), ("_shared_fastpath_client", None)):
+            monkeypatch.setattr(MCPHandler, name, value)
+        entered, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        original = vector._get_table if phase == "table_open" else vector._update_records
+        def blocked(*args):
+            loop.call_soon_threadsafe(entered.set)
+            release.wait()
+            return original(*args)
+        monkeypatch.setattr(vector, "_get_table" if phase == "table_open" else "_update_records", blocked)
+        task = stop = None
+        try:
+            await MCPHandler.start_background_workers(settings=settings, vector_store=vector, client_manager=object())
+            handler = MCPHandler(user=object(), api_key="fixture", vector_store=vector, client_manager=object(), settings=settings)
+            async def do_update(self, request):
+                await vector.update_entry("fixture", "e", {"lossless_restatement":"new"})
+                return JsonRpcResponse(id=request.id, result={"ok":True})
+            handler._dispatch = MethodType(do_update, handler)
+            task = asyncio.create_task(handler.handle_message(json.dumps({"jsonrpc":"2.0", "id":1, "method":"held"})))
+            await entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            stop = asyncio.create_task(MCPHandler.stop_background_workers())
+            await asyncio.sleep(0)
+            assert not task.done() and not stop.done()
+            assert MCPHandler._active_runtime_requests == 1
+            with observer.execution_locks.try_service() as acquired:
+                assert not acquired
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await stop
+            with observer.execution_locks.try_service() as acquired:
+                assert acquired
+        finally:
+            release.set()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+            if stop is not None:
+                await asyncio.gather(stop, return_exceptions=True)
+            if MCPHandler._service_lock_guard is not None:
+                await MCPHandler.stop_background_workers()
+            store.close()
+            observer.close()
+    asyncio.run(scenario())
+
+
+def test_admitted_write_that_reaches_enqueue_during_drain_is_retryable(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from server.database.durable_job_store import DurableJobStore
+    from server.mcp_handler import MCPHandler
+
+    async def scenario():
+        store = DurableJobStore(str(tmp_path / "queue.sqlite"))
+        settings = SimpleNamespace(memory_write_workers=1, memory_write_max_retries=6, memory_write_lease_seconds=90, memory_write_batch_max=1, memory_write_batch_max_wait_ms=10, memory_write_purge_interval_s=300, memory_write_retention_hours=24, memory_write_max_content_chars=8192, memory_write_max_payload_bytes=65536, memory_queue_max_inflight_writes=10, memory_queue_max_global_inflight_writes=10)
+        for name, value in (("_runtime_lock", None), ("_durable_store", store), ("_service_lock_guard", None), ("_durable_runtime_ready", False), ("_runtime_event_loop", None), ("_runtime_drained", None), ("_active_runtime_requests", 0), ("_worker_shutdown", None), ("_worker_tasks", []), ("_retention_task", None), ("_lease_recoveries", 0), ("_shared_fastpath_client", None)):
+            monkeypatch.setattr(MCPHandler, name, value)
+        entered, release = asyncio.Event(), asyncio.Event()
+        task = stop = None
+        try:
+            await MCPHandler.start_background_workers(settings=settings, vector_store=object(), client_manager=object())
+            handler = MCPHandler(user=SimpleNamespace(user_id="fixture", table_name="fixture"), api_key="fixture", vector_store=object(), client_manager=object(), settings=settings)
+            handler.initialized = True
+            original = handler._enqueue_durable
+            async def delayed_enqueue(**kwargs):
+                entered.set()
+                await release.wait()
+                return await original(**kwargs)
+            handler._enqueue_durable = delayed_enqueue
+            req = {"jsonrpc":"2.0", "id":7, "method":"tools/call", "params":{"name":"memory_add", "arguments":{"content":"fixture"}}}
+            task = asyncio.create_task(handler.handle_message(json.dumps(req)))
+            await entered.wait()
+            stop = asyncio.create_task(MCPHandler.stop_background_workers())
+            await asyncio.sleep(0)
+            assert not stop.done() and not MCPHandler._durable_runtime_ready
+            release.set()
+            response = json.loads(await task)
+            assert response["id"] == 7 and response["result"]["isError"] is True
+            detail = json.loads(response["result"]["content"][0]["text"])
+            assert detail["error"] == "simplemem_durable_runtime_not_ready" and detail["retryable"] is True
+            assert store.queue_counts()["pending"] == 0
+            await stop
+        finally:
+            release.set()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+            if stop is not None:
+                await asyncio.gather(stop, return_exceptions=True)
+            if MCPHandler._service_lock_guard is not None:
+                await MCPHandler.stop_background_workers()
+            store.close()
+    asyncio.run(scenario())

@@ -335,7 +335,7 @@ class MultiTenantVectorStore:
         Returns:
             List of matching MemoryEntry objects
         """
-        table = await asyncio.to_thread(self._get_table, table_name)
+        table = await _to_thread_preserving_mutation(self._get_table, table_name)
         table_dim = self._get_table_dimension(table_name, table)
 
         try:
@@ -391,7 +391,7 @@ class MultiTenantVectorStore:
         Returns:
             List of matching MemoryEntry objects
         """
-        table = await asyncio.to_thread(self._get_table, table_name)
+        table = await _to_thread_preserving_mutation(self._get_table, table_name)
 
         try:
             if await asyncio.to_thread(table.count_rows) == 0:
@@ -476,7 +476,7 @@ class MultiTenantVectorStore:
         Returns:
             List of matching MemoryEntry objects
         """
-        table = await asyncio.to_thread(self._get_table, table_name)
+        table = await _to_thread_preserving_mutation(self._get_table, table_name)
 
         try:
             if await asyncio.to_thread(table.count_rows) == 0:
@@ -559,7 +559,7 @@ class MultiTenantVectorStore:
 
     async def get_all_entries(self, table_name: str) -> List[MemoryEntry]:
         """Get all entries from a user's table"""
-        table = await asyncio.to_thread(self._get_table, table_name)
+        table = await _to_thread_preserving_mutation(self._get_table, table_name)
 
         try:
             if await asyncio.to_thread(table.count_rows) == 0:
@@ -599,7 +599,7 @@ class MultiTenantVectorStore:
         entry_id = str(entry_id or "").strip()
         if not entry_id:
             return None
-        table = await asyncio.to_thread(self._get_table, table_name)
+        table = await _to_thread_preserving_mutation(self._get_table, table_name)
         try:
             if await asyncio.to_thread(table.count_rows) == 0:
                 return None
@@ -667,7 +667,7 @@ class MultiTenantVectorStore:
         if not updates and embedding is None:
             return {"found": False, "updated": False, "error": "updates_required"}
 
-        table = await asyncio.to_thread(self._get_table, table_name)
+        table = await _to_thread_preserving_mutation(self._get_table, table_name)
         try:
             if await asyncio.to_thread(table.count_rows) == 0:
                 return {"found": False, "updated": False, "entry_id": entry_id}
@@ -690,7 +690,7 @@ class MultiTenantVectorStore:
             if embedding is not None:
                 update_values["vector"] = record["vector"]
             try:
-                await asyncio.to_thread(
+                await _to_thread_preserving_mutation(
                     self._update_records, table_name, where, update_values
                 )
                 updated = await self.get_entry(table_name, entry_id)
@@ -725,7 +725,7 @@ class MultiTenantVectorStore:
 
     async def count_entries(self, table_name: str) -> int:
         """Count entries in a user's table"""
-        table = await asyncio.to_thread(self._get_table, table_name)
+        table = await _to_thread_preserving_mutation(self._get_table, table_name)
         try:
             return int(await asyncio.to_thread(table.count_rows))
         except Exception:

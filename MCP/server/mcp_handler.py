@@ -65,6 +65,10 @@ class MemoryBackendUnavailable(RuntimeError):
     """Configured shared retrieval is incomplete; callers must retry."""
 
 
+class DurableRuntimeUnavailable(RuntimeError):
+    """The durable service is draining or has not started; callers must retry."""
+
+
 class MCPHandler:
     """Handles MCP protocol messages for a specific user session."""
 
@@ -77,6 +81,9 @@ class MCPHandler:
     _service_lock_guard: Optional[Any] = None
     _durable_initialization_lock = threading.Lock()
     _durable_runtime_ready = False
+    _runtime_event_loop: Optional[asyncio.AbstractEventLoop] = None
+    _runtime_drained: Optional[asyncio.Event] = None
+    _active_runtime_requests = 0
     _shared_settings: Optional[Any] = None
     _shared_vector_store: Optional[MultiTenantVectorStore] = None
     _shared_client_manager: Optional[ClientManager] = None
@@ -273,6 +280,14 @@ class MCPHandler:
                     raise
 
             try:
+                with cls._durable_initialization_lock:
+                    loop = asyncio.get_running_loop()
+                    if cls._runtime_event_loop is None:
+                        cls._runtime_event_loop = loop
+                        cls._runtime_drained = asyncio.Event()
+                        cls._runtime_drained.set()
+                    elif cls._runtime_event_loop is not loop:
+                        raise RuntimeError("simplemem_runtime_event_loop_mismatch")
                 if isinstance(vector_store, MultiTenantVectorStore):
                     vector_store.set_pending_replay_checker(cls._durable_store.has_pending_entry)
                 if cls._worker_shutdown is None:
@@ -310,6 +325,8 @@ class MCPHandler:
                     with cls._durable_initialization_lock:
                         cls._service_lock_guard.__exit__(None, None, None)
                         cls._service_lock_guard = None
+                        cls._runtime_event_loop = None
+                        cls._runtime_drained = None
                 raise
 
     @classmethod
@@ -318,7 +335,14 @@ class MCPHandler:
             cls._runtime_lock = asyncio.Lock()
         async with cls._runtime_lock:
             with cls._durable_initialization_lock:
+                if cls._runtime_event_loop is not None and cls._runtime_event_loop is not asyncio.get_running_loop():
+                    raise RuntimeError("simplemem_runtime_event_loop_mismatch")
                 cls._durable_runtime_ready = False
+                drained = cls._runtime_drained
+            # An admitted request may still be performing a Lance mutation or
+            # waiting for a durable job. Keep workers and ownership alive.
+            if drained is not None:
+                await drained.wait()
             if cls._worker_shutdown is not None:
                 cls._worker_shutdown.set()
             if cls._retention_task is not None:
@@ -337,6 +361,8 @@ class MCPHandler:
                 if cls._service_lock_guard is not None:
                     cls._service_lock_guard.__exit__(None, None, None)
                     cls._service_lock_guard = None
+                cls._runtime_event_loop = None
+                cls._runtime_drained = None
 
     @classmethod
     async def _durable_retention_loop(cls) -> None:
@@ -1316,18 +1342,22 @@ class MCPHandler:
                 f"{kind} payload exceeds {max_payload_bytes} bytes"
             )
 
-        out = store.enqueue_or_get(
-            user_id=self.user.user_id,
-            kind=kind,
-            idempotency_key=idem,
-            payload=payload,
-            max_inflight_writes=max(
-                10, int(self.settings.memory_queue_max_inflight_writes)
-            ),
-            max_global_inflight_writes=max(
-                10, int(self.settings.memory_queue_max_global_inflight_writes)
-            ),
-        )
+        # Check and enqueue atomically with shutdown's readiness transition.
+        with MCPHandler._durable_initialization_lock:
+            if not MCPHandler._durable_runtime_ready or MCPHandler._service_lock_guard is None:
+                raise DurableRuntimeUnavailable("simplemem_durable_runtime_not_ready")
+            out = store.enqueue_or_get(
+                user_id=self.user.user_id,
+                kind=kind,
+                idempotency_key=idem,
+                payload=payload,
+                max_inflight_writes=max(
+                    10, int(self.settings.memory_queue_max_inflight_writes)
+                ),
+                max_global_inflight_writes=max(
+                    10, int(self.settings.memory_queue_max_global_inflight_writes)
+                ),
+            )
         if out.get("accepted"):
             MCPHandler._write_stats["accepted"] += 1
             MCPHandler._user_write_stat(self.user.user_id, "accepted")
@@ -1417,8 +1447,27 @@ class MCPHandler:
                         error={"code": -32602, "message": "Invalid params"},
                     ).to_dict()
                 )
-            response = await self._dispatch(request)
-            return json.dumps(response.to_dict(), ensure_ascii=False)
+            with MCPHandler._durable_initialization_lock:
+                if (
+                    not MCPHandler._durable_runtime_ready
+                    or MCPHandler._service_lock_guard is None
+                    or MCPHandler._runtime_drained is None
+                    or MCPHandler._runtime_event_loop is not asyncio.get_running_loop()
+                ):
+                    return json.dumps(JsonRpcResponse(
+                        id=request.id,
+                        error={"code": -32000, "message": "simplemem_durable_runtime_not_ready", "data": {"retryable": True}},
+                    ).to_dict())
+                MCPHandler._active_runtime_requests += 1
+                MCPHandler._runtime_drained.clear()
+            try:
+                response = await self._dispatch(request)
+                return json.dumps(response.to_dict(), ensure_ascii=False)
+            finally:
+                with MCPHandler._durable_initialization_lock:
+                    MCPHandler._active_runtime_requests -= 1
+                    if MCPHandler._active_runtime_requests == 0:
+                        MCPHandler._runtime_drained.set()
         except json.JSONDecodeError as exc:
             return json.dumps(
                 JsonRpcResponse(
@@ -1771,7 +1820,7 @@ class MCPHandler:
             raise ValueError(f"Unknown tool: {name}")
         try:
             result = await handler(arguments)
-        except MemoryBackendUnavailable as exc:
+        except (MemoryBackendUnavailable, DurableRuntimeUnavailable) as exc:
             return {
                 "isError": True,
                 "content": [{

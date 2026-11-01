@@ -138,7 +138,7 @@ def test_real_generator_explicit_cancellation_releases_owner_waiter_and_read_per
     asyncio.run(exercise())
 
 
-def test_generation_failure_through_actual_jsonrpc_retains_id_and_same_query_recovers():
+def test_generation_failure_through_actual_jsonrpc_retains_id_and_same_query_recovers(deliver_ready_message):
     import json
     async def exercise():
         client = ParsedReplyClient(None)
@@ -146,12 +146,12 @@ def test_generation_failure_through_actual_jsonrpc_retains_id_and_same_query_rec
         handler.initialized = True
         request = {"jsonrpc": "2.0", "id": 47, "method": "tools/call",
                    "params": {"name": "memory_query", "arguments": {"question": "wire error fixture"}}}
-        result = json.loads(await handler.handle_message(json.dumps(request)))
+        result = json.loads(await deliver_ready_message(handler, json.dumps(request)))
         assert result["id"] == 47 and result["error"]["code"] == -32603
         assert not MCPHandler._query_inflight and not MCPHandler._query_cache
         client.data = {"answer": "wire recovered", "confidence": "high"}
         request["id"] = 48
-        recovered = json.loads(await handler.handle_message(json.dumps(request)))
+        recovered = json.loads(await deliver_ready_message(handler, json.dumps(request)))
         assert recovered["id"] == 48 and "error" not in recovered
         body = json.loads(recovered["result"]["content"][0]["text"])
         assert body["answer"] == "wire recovered"

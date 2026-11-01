@@ -561,10 +561,10 @@ def test_mcp_rejects_cross_user_job_status(tmp_path, monkeypatch) -> None:
     assert result["found"] is False
 
 
-def test_mcp_unknown_method_is_json_rpc_method_not_found() -> None:
+def test_mcp_unknown_method_is_json_rpc_method_not_found(deliver_ready_message) -> None:
     handler = object.__new__(MCPHandler)
     response = asyncio.run(
-        handler.handle_message(
+        deliver_ready_message(handler,
             json.dumps({"jsonrpc": "2.0", "id": "probe", "method": "unknown"})
         )
     )
@@ -647,7 +647,7 @@ def test_mcp_malformed_request_is_not_reported_as_internal_error(
         ("memory_add_batch", {"dialogues": [{"speaker": "user", "content": "fixture"}]}),
     ],
 )
-def test_distinct_oversize_idempotency_keys_fail_without_enqueue(monkeypatch, tool, arguments) -> None:
+def test_distinct_oversize_idempotency_keys_fail_without_enqueue(monkeypatch, deliver_ready_message, tool, arguments) -> None:
     class ForbiddenStore:
         def enqueue_or_get(self, **_kwargs):
             pytest.fail("oversize idempotency key reached the durable store")
@@ -664,7 +664,7 @@ def test_distinct_oversize_idempotency_keys_fail_without_enqueue(monkeypatch, to
             "name": tool,
             "arguments": {**arguments, "idempotency_key": "k" * 256 + suffix},
         }}
-        response = json.loads(asyncio.run(handler.handle_message(json.dumps(request))))
+        response = json.loads(asyncio.run(deliver_ready_message(handler, json.dumps(request))))
         assert response["id"] == 42
         assert response["error"] == {"code": -32602, "message": "idempotency_key exceeds 256 characters"}
 
@@ -687,7 +687,7 @@ def test_idempotency_limit_preserves_valid_keys_and_is_advertised() -> None:
         assert "256 characters after trimming" in schema["description"]
 
 
-def test_batch_payload_limit_rejects_oversize_before_durable_enqueue(monkeypatch) -> None:
+def test_batch_payload_limit_rejects_oversize_before_durable_enqueue(monkeypatch, deliver_ready_message) -> None:
     class ForbiddenStore:
         def enqueue_or_get(self, **_kwargs):
             pytest.fail("oversize payload reached the durable store")
@@ -705,7 +705,7 @@ def test_batch_payload_limit_rejects_oversize_before_durable_enqueue(monkeypatch
         "name": "memory_add_batch",
         "arguments": {"idempotency_key": "bounded", "dialogues": [{"content": "fixture", "extra": "x" * 70000}]},
     }}
-    response = json.loads(asyncio.run(handler.handle_message(json.dumps(request))))
+    response = json.loads(asyncio.run(deliver_ready_message(handler, json.dumps(request))))
     assert response["id"] == 43
     assert response["error"]["code"] == -32602
     assert "payload exceeds 65536 bytes" in response["error"]["message"]
