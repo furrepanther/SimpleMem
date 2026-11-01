@@ -665,14 +665,6 @@ class MultiTenantVectorStore:
                 await asyncio.to_thread(
                     self._update_records, table_name, where, update_values
                 )
-                updated = await self.get_entry(table_name, entry_id)
-                if updated is not None:
-                    return {
-                        "found": True,
-                        "updated": True,
-                        "entry_id": entry_id,
-                        "method": "update",
-                    }
             except Exception:
                 return {
                     "found": True,
@@ -680,11 +672,46 @@ class MultiTenantVectorStore:
                     "entry_id": entry_id,
                     "error": "table_update_failed",
                 }
+            try:
+                verified = await asyncio.to_thread(
+                    lambda: table.search().where(where).limit(1).to_pandas()
+                )
+                if verified.empty:
+                    return {
+                        "found": True,
+                        "updated": False,
+                        "entry_id": entry_id,
+                        "error": "table_update_not_applied",
+                    }
+                verified_row = verified.iloc[0]
+                actual = self._row_to_record(verified_row, table_dim=table_dim)
+                for key, expected in update_values.items():
+                    if key == "vector":
+                        # Compare the stored float32 values, not their widened
+                        # Python float representations.
+                        stored = pa.array(self._list_or_empty(verified_row["vector"]), type=pa.float32())
+                        matches = stored.equals(pa.array(expected, type=pa.float32()))
+                    else:
+                        matches = actual[key] == expected
+                    if not matches:
+                        return {
+                            "found": True,
+                            "updated": False,
+                            "entry_id": entry_id,
+                            "error": "table_update_verification_mismatch",
+                        }
+            except Exception:
+                return {
+                    "found": True,
+                    "updated": False,
+                    "entry_id": entry_id,
+                    "error": "table_update_verification_failed",
+                }
             return {
                 "found": True,
-                "updated": False,
+                "updated": True,
                 "entry_id": entry_id,
-                "error": "table_update_not_applied",
+                "method": "update",
             }
         except Exception as e:
             print(f"Update entry error: {e}")
