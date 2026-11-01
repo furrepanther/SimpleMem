@@ -631,3 +631,118 @@ def test_mcp_malformed_request_is_not_reported_as_internal_error(
     payload = json.loads(response)
 
     assert payload["error"]["code"] == error_code
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("memory_store", {"content": "fixture"}),
+        ("memory_add", {"content": "fixture"}),
+        ("memory_add_batch", {"dialogues": [{"speaker": "user", "content": "fixture"}]}),
+    ],
+)
+def test_distinct_oversize_idempotency_keys_fail_without_enqueue(monkeypatch, tool, arguments) -> None:
+    class ForbiddenStore:
+        def enqueue_or_get(self, **_kwargs):
+            pytest.fail("oversize idempotency key reached the durable store")
+
+    monkeypatch.setattr(MCPHandler, "_durable_store", ForbiddenStore())
+    handler = MCPHandler.__new__(MCPHandler)
+    handler.user = User(user_id="fixture")
+    handler.settings = SimpleNamespace(
+        memory_write_max_content_chars=8192,
+        memory_write_max_metadata_chars=2048,
+    )
+    for suffix in ("A", "B"):
+        request = {"jsonrpc": "2.0", "id": 42, "method": "tools/call", "params": {
+            "name": tool,
+            "arguments": {**arguments, "idempotency_key": "k" * 256 + suffix},
+        }}
+        response = json.loads(asyncio.run(handler.handle_message(json.dumps(request))))
+        assert response["id"] == 42
+        assert response["error"] == {"code": -32602, "message": "idempotency_key exceeds 256 characters"}
+
+
+def test_idempotency_limit_preserves_valid_keys_and_is_advertised() -> None:
+    handler = MCPHandler.__new__(MCPHandler)
+    handler.user = User(user_id="fixture")
+    assert handler._compute_idempotency_key(kind="memory_store", args={"idempotency_key": "k" * 256}) == "k" * 256
+    assert handler._compute_idempotency_key(kind="memory_store", args={"idempotency_key": "  key  "}) == "key"
+    with pytest.raises(ValueError, match="idempotency_key exceeds 256"):
+        handler._compute_idempotency_key(kind="memory_store", args={"idempotency_key": " " * 257})
+    tools = asyncio.run(handler._handle_tools_list({}))["tools"]
+    write_tools = {tool["name"]: tool for tool in tools if tool["name"] in {"memory_store", "memory_add", "memory_add_batch"}}
+    assert set(write_tools) == {"memory_store", "memory_add", "memory_add_batch"}
+    for tool in write_tools.values():
+        assert tool["inputSchema"]["properties"]["idempotency_key"]["maxLength"] == 256
+
+
+def test_batch_payload_limit_rejects_oversize_before_durable_enqueue(monkeypatch) -> None:
+    class ForbiddenStore:
+        def enqueue_or_get(self, **_kwargs):
+            pytest.fail("oversize payload reached the durable store")
+
+    monkeypatch.setattr(MCPHandler, "_durable_store", ForbiddenStore())
+    handler = MCPHandler.__new__(MCPHandler)
+    handler.user = User(user_id="fixture")
+    handler.settings = SimpleNamespace(
+        memory_write_max_content_chars=8192,
+        memory_write_max_batch_content_chars=32768,
+        memory_write_max_batch_items=16,
+        memory_write_max_payload_bytes=65536,
+    )
+    request = {"jsonrpc": "2.0", "id": 43, "method": "tools/call", "params": {
+        "name": "memory_add_batch",
+        "arguments": {"idempotency_key": "bounded", "dialogues": [{"content": "fixture", "extra": "x" * 70000}]},
+    }}
+    response = json.loads(asyncio.run(handler.handle_message(json.dumps(request))))
+    assert response["id"] == 43
+    assert response["error"]["code"] == -32602
+    assert "payload exceeds 65536 bytes" in response["error"]["message"]
+
+
+def test_lease_recovery_retries_unprocessed_rows_after_partial_failure(tmp_path) -> None:
+    store = DurableJobStore(str(tmp_path / "lease-recovery.db"))
+    for user in ("user-a", "user-b"):
+        store.enqueue_or_get(user_id=user, kind="memory_store", idempotency_key=user,
+                             payload={"content": user}, max_inflight_writes=10)
+    claimed = store.claim_batch(worker_id="fixture", batch_size=2, lease_seconds=5)
+    assert len(claimed) == 2
+    conn = store._get_connection()
+    conn.execute("UPDATE durable_jobs SET lease_expires_at_utc = '2000-01-01T00:00:00+00:00'")
+    rows = conn.execute("SELECT job_id FROM durable_jobs WHERE status = 'processing' AND lease_expires_at_utc < ?", (store._utc_now_iso(),)).fetchall()
+    first, second = (str(row["job_id"]) for row in rows)
+    conn.create_function("is_fixture_second_job", 1, lambda job_id: job_id == second)
+    conn.execute("CREATE TRIGGER inject_recovery_error BEFORE UPDATE ON durable_jobs WHEN is_fixture_second_job(OLD.job_id) AND NEW.status = 'failed_retryable' BEGIN SELECT RAISE(ABORT, 'fixture recovery failure'); END")
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="fixture recovery failure"):
+            store.recover_expired_leases()
+        assert store.get_job(job_id=first)["status"] == "failed_retryable"
+        assert store.get_job(job_id=second)["status"] == "processing"
+        conn.execute("DROP TRIGGER inject_recovery_error")
+        assert store.recover_expired_leases() == 1
+        for job_id in (first, second):
+            row = store.get_job(job_id=job_id)
+            assert row["status"] == "failed_retryable" and row["attempt_count"] == 1
+    finally:
+        store.close()
+
+
+def test_user_credential_is_encrypted_before_durable_storage(tmp_path) -> None:
+    from server.auth.token_manager import TokenManager
+    from server.database.user_store import UserStore
+
+    manager = TokenManager(secret_key="j" * 64, encryption_key="e" * 64)
+    cleartext = "private-fixture-key"
+    user = User(user_id="fixture")
+    user.openrouter_api_key_encrypted = manager.encrypt_api_key(cleartext)
+    assert cleartext not in user.openrouter_api_key_encrypted
+    store = UserStore(str(tmp_path / "users.db"))
+    try:
+        store.create_user(user)
+        stored = store.get_user(user.user_id)
+        assert stored is not None
+        assert cleartext not in stored.openrouter_api_key_encrypted
+        assert manager.decrypt_api_key(stored.openrouter_api_key_encrypted) == cleartext
+    finally:
+        store._get_connection().close()

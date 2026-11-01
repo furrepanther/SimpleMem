@@ -1075,9 +1075,12 @@ class MCPHandler:
         )
 
     def _compute_idempotency_key(self, *, kind: str, args: dict[str, Any]) -> str:
-        provided = str(args.get("idempotency_key", "")).strip()
+        provided = str(args.get("idempotency_key", ""))
+        if len(provided) > 256:
+            raise ValueError("idempotency_key exceeds 256 characters")
+        provided = provided.strip()
         if provided:
-            return provided[:256]
+            return provided
         if kind == "memory_store":
             core = {
                 "user_id": self.user.user_id,
@@ -1445,6 +1448,7 @@ class MCPHandler:
                             },
                             "idempotency_key": {
                                 "type": "string",
+                                "maxLength": 256,
                                 "description": "Optional idempotency key",
                             },
                         },
@@ -1491,6 +1495,7 @@ class MCPHandler:
                             },
                             "idempotency_key": {
                                 "type": "string",
+                                "maxLength": 256,
                                 "description": "Optional idempotency key",
                             },
                         },
@@ -1521,6 +1526,7 @@ class MCPHandler:
                             },
                             "idempotency_key": {
                                 "type": "string",
+                                "maxLength": 256,
                                 "description": "Optional idempotency key",
                             },
                         },
