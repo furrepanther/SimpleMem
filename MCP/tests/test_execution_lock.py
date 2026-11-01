@@ -166,3 +166,53 @@ def test_recovery_does_not_reassign_or_terminalize_live_locked_job(tmp_path):
     finally:
         owner.close()
         recovery.close()
+
+
+def test_concurrent_first_initialization_pins_one_lock_identity(tmp_path):
+    path, connection = _queue(tmp_path)
+    connection.close()
+    child = """
+import json, sqlite3, sys
+from server.database.execution_lock import JobExecutionLocks
+connection = sqlite3.connect(sys.argv[1], timeout=10, isolation_level=None)
+print('ready', flush=True)
+sys.stdin.readline()
+locks = JobExecutionLocks(sys.argv[1], connection)
+print(json.dumps({'inode': locks.inode, 'token': locks.token}), flush=True)
+connection.close()
+"""
+    procs = [subprocess.Popen([sys.executable, "-c", child, str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+    try:
+        for proc in procs:
+            assert proc.stdout.readline().strip() == "ready"
+        for proc in procs:
+            proc.stdin.write("start\n")
+            proc.stdin.flush()
+            proc.stdin.close()
+        outputs = [proc.stdout.readline().strip() for proc in procs]
+        for proc in procs:
+            assert proc.wait() == 0, proc.stderr.read()
+        assert outputs[0] and outputs[0] == outputs[1]
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                if proc.stdin and not proc.stdin.closed:
+                    proc.stdin.close()
+                proc.wait()
+
+
+def test_refuses_shared_or_hardlinked_lock_file(tmp_path):
+    path, connection = _queue(tmp_path)
+    locks = JobExecutionLocks(str(path), connection)
+    try:
+        locks.path.chmod(0o644)
+        with pytest.raises(RuntimeError, match="unsafe"):
+            with locks.try_job("job-a"):
+                pass
+        locks.path.chmod(0o600)
+        os.link(locks.path, tmp_path / "lock-alias")
+        with pytest.raises(RuntimeError, match="unsafe"):
+            with locks.try_job("job-a"):
+                pass
+    finally:
+        connection.close()
