@@ -13,6 +13,28 @@ from typing import List, Dict, Any, Optional, AsyncGenerator
 logger = logging.getLogger(__name__)
 
 
+def _local_endpoints(
+    base_url: str, embedding_base_url: Optional[str], rerank_base_url: Optional[str]
+) -> tuple[str, str, str]:
+    embedding_url = base_url if embedding_base_url is None else embedding_base_url
+    rerank_url = embedding_url if rerank_base_url is None else rerank_base_url
+    for name, endpoint in (
+        ("base_url", base_url),
+        ("embedding_base_url", embedding_url),
+        ("rerank_base_url", rerank_url),
+    ):
+        # Importing config.settings also loads the environment file, so mirror
+        # its loopback rule here without introducing that import-time side effect.
+        parsed = urlparse(endpoint.strip()) if isinstance(endpoint, str) else None
+        if (
+            parsed is None
+            or parsed.scheme not in {"http", "https"}
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        ):
+            raise ValueError(f"{name} must use a loopback HTTP(S) URL")
+    return base_url, embedding_url, rerank_url
+
+
 class OpenRouterClient:
     """
     OpenRouter API client for LLM and Embedding operations.
@@ -30,19 +52,20 @@ class OpenRouterClient:
     def __init__(
         self,
         api_key: str,
-        base_url: str = "https://openrouter.ai/api/v1",
+        base_url: str,
         embedding_base_url: Optional[str] = None,
         rerank_base_url: Optional[str] = None,
         llm_model: str = "openai/gpt-4.1-mini",
         embedding_model: str = "BAAI/bge-m3",
         reranker_model: str = "BAAI/bge-reranker-v2-m3",
     ):
+        base_url, embedding_url, rerank_url = _local_endpoints(
+            base_url, embedding_base_url, rerank_base_url
+        )
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
-        self.embedding_base_url = (embedding_base_url or base_url).rstrip("/")
-        self.rerank_base_url = (
-            rerank_base_url or embedding_base_url or base_url
-        ).rstrip("/")
+        self.embedding_base_url = embedding_url.rstrip("/")
+        self.rerank_base_url = rerank_url.rstrip("/")
         self.llm_model = llm_model
         self.embedding_model = embedding_model
         self.reranker_model = reranker_model
@@ -529,16 +552,19 @@ class OpenRouterClientManager:
 
     def __init__(
         self,
-        base_url: str = "https://openrouter.ai/api/v1",
+        base_url: str,
         embedding_base_url: Optional[str] = None,
         rerank_base_url: Optional[str] = None,
         llm_model: str = "openai/gpt-4.1-mini",
         embedding_model: str = "BAAI/bge-m3",
         reranker_model: str = "BAAI/bge-reranker-v2-m3",
     ):
+        base_url, embedding_url, rerank_url = _local_endpoints(
+            base_url, embedding_base_url, rerank_base_url
+        )
         self.base_url = base_url
-        self.embedding_base_url = embedding_base_url or base_url
-        self.rerank_base_url = rerank_base_url or self.embedding_base_url
+        self.embedding_base_url = embedding_url
+        self.rerank_base_url = rerank_url
         self.llm_model = llm_model
         self.embedding_model = embedding_model
         self.reranker_model = reranker_model

@@ -7,7 +7,7 @@ from server.integrations.openrouter import OpenRouterClient
 
 class RecordingEmbeddingClient(OpenRouterClient):
     def __init__(self) -> None:
-        super().__init__(api_key="", embedding_base_url="http://127.0.0.1:11501/v1")
+        super().__init__(api_key="", base_url="http://127.0.0.1:11437/v1", embedding_base_url="http://127.0.0.1:11501/v1")
         self.requests: list[str] = []
 
     async def create_single_embedding(self, text: str, **_kwargs: object) -> list[float]:
