@@ -212,11 +212,11 @@ class MCPHandler:
             vector_store.set_pending_replay_checker(MCPHandler._durable_store.has_pending_entry)
 
     @classmethod
-    def _initialize_durable_runtime(cls, settings: Any) -> None:
+    def _initialize_durable_runtime(cls, settings: Any) -> bool:
         """Own the service lock before migration, recovery, or serving requests."""
         with cls._durable_initialization_lock:
             if cls._service_lock_guard is not None:
-                return
+                return False
             created_store = cls._durable_store is None
             store = cls._durable_store or DurableJobStore(settings.durable_queue_db_path)
             guard = store.execution_locks.try_service()
@@ -239,6 +239,7 @@ class MCPHandler:
             cls._durable_store = store
             cls._service_lock_guard = guard
             cls._lease_recoveries += recovered
+            return True
 
     @classmethod
     async def start_background_workers(
@@ -260,25 +261,54 @@ class MCPHandler:
                 cls._shared_user_store = user_store
             if token_manager is not None:
                 cls._shared_token_manager = token_manager
-            cls._initialize_durable_runtime(settings)
-            if isinstance(vector_store, MultiTenantVectorStore):
-                vector_store.set_pending_replay_checker(cls._durable_store.has_pending_entry)
-            if cls._worker_shutdown is None:
-                cls._worker_shutdown = asyncio.Event()
-            cls._worker_shutdown.clear()
-            if cls._retention_task is None:
-                cls._retention_task = asyncio.create_task(
-                    cls._durable_retention_loop(),
-                    name="simplemem-durable-retention",
-                )
-            target = max(1, int(settings.memory_write_workers))
-            while len(cls._worker_tasks) < target:
-                idx = len(cls._worker_tasks) + 1
-                task = asyncio.create_task(
-                    cls._durable_worker_loop(idx),
-                    name=f"simplemem-durable-worker-{idx}",
-                )
-                cls._worker_tasks.append(task)
+            acquired_here = cls._initialize_durable_runtime(settings)
+            new_workers: list[asyncio.Task] = []
+            new_retention: Optional[asyncio.Task] = None
+
+            def create_task(coroutine: Any, *, name: str) -> asyncio.Task:
+                try:
+                    return asyncio.create_task(coroutine, name=name)
+                except BaseException:
+                    coroutine.close()
+                    raise
+
+            try:
+                if isinstance(vector_store, MultiTenantVectorStore):
+                    vector_store.set_pending_replay_checker(cls._durable_store.has_pending_entry)
+                if cls._worker_shutdown is None:
+                    cls._worker_shutdown = asyncio.Event()
+                cls._worker_shutdown.clear()
+                if cls._retention_task is None:
+                    new_retention = create_task(
+                        cls._durable_retention_loop(),
+                        name="simplemem-durable-retention",
+                    )
+                    cls._retention_task = new_retention
+                target = max(1, int(settings.memory_write_workers))
+                while len(cls._worker_tasks) < target:
+                    idx = len(cls._worker_tasks) + 1
+                    task = create_task(
+                        cls._durable_worker_loop(idx),
+                        name=f"simplemem-durable-worker-{idx}",
+                    )
+                    new_workers.append(task)
+                    cls._worker_tasks.append(task)
+            except BaseException:
+                # These tasks were created without yielding, so none has begun
+                # processing an accepted job. Leave preexisting workers intact.
+                created = new_workers + ([new_retention] if new_retention else [])
+                for task in created:
+                    task.cancel()
+                if created:
+                    await asyncio.gather(*created, return_exceptions=True)
+                cls._worker_tasks = [task for task in cls._worker_tasks if task not in new_workers]
+                if new_retention is not None:
+                    cls._retention_task = None
+                if acquired_here:
+                    with cls._durable_initialization_lock:
+                        cls._service_lock_guard.__exit__(None, None, None)
+                        cls._service_lock_guard = None
+                raise
 
     @classmethod
     async def stop_background_workers(cls) -> None:
