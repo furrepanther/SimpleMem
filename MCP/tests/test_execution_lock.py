@@ -137,3 +137,32 @@ def test_child_exec_does_not_inherit_job_lock(tmp_path):
                 proc.stdin.close()
             proc.wait()
         connection.close()
+
+
+def test_recovery_does_not_reassign_or_terminalize_live_locked_job(tmp_path):
+    from server.database.durable_job_store import DurableJobStore
+
+    db = str(tmp_path / "queue.sqlite")
+    owner = DurableJobStore(db)
+    recovery = DurableJobStore(db)
+    try:
+        job_id = owner.enqueue_or_get(user_id="fixture", kind="memory_store", idempotency_key="k", payload={"content": "fixture"}, max_inflight_writes=10)["job_id"]
+        assert owner.claim_batch(worker_id="owner", batch_size=1, lease_seconds=5)[0]["job_id"] == job_id
+        owner._get_connection().execute("UPDATE durable_jobs SET lease_expires_at_utc = '2000-01-01T00:00:00+00:00' WHERE job_id = ?", (job_id,))
+        with owner.execution_locks.try_job(job_id) as acquired:
+            assert acquired
+            assert recovery.recover_expired_leases(max_retries=1) == 0
+            row = recovery.get_job(job_id=job_id)
+            assert row["status"] == "processing"
+            assert row["lease_owner"] == "owner"
+            assert row["attempt_count"] == 0
+            assert recovery.claim_batch(worker_id="other", batch_size=1, lease_seconds=5) == []
+        assert recovery.recover_expired_leases(max_retries=2) == 1
+        row = recovery.get_job(job_id=job_id)
+        assert row["status"] == "failed_retryable" and row["attempt_count"] == 1
+        assert recovery.claim_batch(worker_id="other", batch_size=1, lease_seconds=5)[0]["job_id"] == job_id
+        assert not owner.mark_done(job_id=job_id, lease_owner="owner", result={"stale": True})
+        assert recovery.mark_done(job_id=job_id, lease_owner="other", result={"ok": True})
+    finally:
+        owner.close()
+        recovery.close()

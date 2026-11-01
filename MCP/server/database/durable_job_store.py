@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from .execution_lock import JobExecutionLocks
+
 
 class DurableJobStore:
     """SQLite WAL durable queue with idempotent enqueue + leasing."""
@@ -28,6 +30,7 @@ class DurableJobStore:
         if parent:
             os.makedirs(parent, exist_ok=True)
         self._init_db()
+        self.execution_locks = JobExecutionLocks(db_path, self._get_connection())
 
     @staticmethod
     def _utc_now() -> datetime:
@@ -515,33 +518,38 @@ class DurableJobStore:
                 attempt_count = int(row["attempt_count"]) + 1
                 terminal = attempt_count >= max(1, int(max_retries))
                 status = "failed_terminal" if terminal else "failed_retryable"
-                cur = conn.execute(
-                    """
-                    UPDATE durable_jobs
-                    SET status = ?,
-                        attempt_count = ?,
-                        available_at_utc = ?,
-                        lease_owner = NULL,
-                        lease_expires_at_utc = NULL,
-                        last_error = ?,
-                        updated_at_utc = ?
-                    WHERE job_id = ?
-                      AND status = 'processing'
-                      AND lease_owner = ?
-                      AND lease_expires_at_utc = ?
-                    """,
-                    (
-                        status,
-                        attempt_count,
-                        now_iso,
-                        "lease expired before completion",
-                        now_iso,
-                        job_id,
-                        str(row["lease_owner"]),
-                        str(row["lease_expires_at_utc"]),
-                    ),
-                )
-                recovered += int(cur.rowcount or 0)
+                # Expiry invites a liveness check; it does not prove that the
+                # owner or its in-flight side effect has stopped.
+                with self.execution_locks.try_job(job_id) as acquired:
+                    if not acquired:
+                        continue
+                    cur = conn.execute(
+                        """
+                        UPDATE durable_jobs
+                        SET status = ?,
+                            attempt_count = ?,
+                            available_at_utc = ?,
+                            lease_owner = NULL,
+                            lease_expires_at_utc = NULL,
+                            last_error = ?,
+                            updated_at_utc = ?
+                        WHERE job_id = ?
+                          AND status = 'processing'
+                          AND lease_owner = ?
+                          AND lease_expires_at_utc = ?
+                        """,
+                        (
+                            status,
+                            attempt_count,
+                            now_iso,
+                            "lease expired before completion",
+                            now_iso,
+                            job_id,
+                            str(row["lease_owner"]),
+                            str(row["lease_expires_at_utc"]),
+                        ),
+                    )
+                    recovered += int(cur.rowcount or 0)
             return recovered
 
     def queue_counts(self, user_id: Optional[str] = None) -> dict[str, Any]:
