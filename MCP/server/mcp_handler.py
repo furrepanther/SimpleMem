@@ -316,8 +316,17 @@ class MCPHandler:
                 created = new_workers + ([new_retention] if new_retention else [])
                 for task in created:
                     task.cancel()
+                cancelled_during_cleanup = False
                 if created:
-                    await asyncio.gather(*created, return_exceptions=True)
+                    cleanup = asyncio.gather(*created, return_exceptions=True)
+                    while True:
+                        try:
+                            await asyncio.shield(cleanup)
+                            break
+                        except asyncio.CancelledError:
+                            if cleanup.cancelled():
+                                raise RuntimeError("startup_cleanup_completion_unobservable")
+                            cancelled_during_cleanup = True
                 cls._worker_tasks = [task for task in cls._worker_tasks if task not in new_workers]
                 if new_retention is not None:
                     cls._retention_task = None
@@ -327,6 +336,8 @@ class MCPHandler:
                         cls._service_lock_guard = None
                         cls._runtime_event_loop = None
                         cls._runtime_drained = None
+                if cancelled_during_cleanup:
+                    raise asyncio.CancelledError
                 raise
 
     @classmethod

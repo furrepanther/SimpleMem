@@ -1464,3 +1464,102 @@ def test_admitted_write_that_reaches_enqueue_during_drain_is_retryable(tmp_path,
                 await MCPHandler.stop_background_workers()
             store.close()
     asyncio.run(scenario())
+
+
+def test_cancelled_startup_rollback_releases_service_only_after_cleanup(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from server.database.durable_job_store import DurableJobStore
+    from server.mcp_handler import MCPHandler
+
+    async def scenario():
+        store = DurableJobStore(str(tmp_path / "queue.sqlite"))
+        observer = DurableJobStore(store.db_path)
+        settings = SimpleNamespace(memory_write_workers=1, memory_write_max_retries=6, memory_write_lease_seconds=90, memory_write_batch_max=1, memory_write_batch_max_wait_ms=10, memory_write_purge_interval_s=300, memory_write_retention_hours=24)
+        for name, value in (("_runtime_lock", None), ("_durable_store", store), ("_service_lock_guard", None), ("_durable_runtime_ready", False), ("_runtime_event_loop", None), ("_runtime_drained", None), ("_active_runtime_requests", 0), ("_worker_shutdown", None), ("_worker_tasks", []), ("_retention_task", None), ("_lease_recoveries", 0), ("_shared_fastpath_client", None)):
+            monkeypatch.setattr(MCPHandler, name, value)
+        real_create_task = asyncio.create_task
+        calls = 0
+        def faulty_create_task(coroutine, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                task = asyncio.current_task()
+                asyncio.get_running_loop().call_soon(task.cancel)
+                asyncio.get_running_loop().call_soon(task.cancel)
+                raise RuntimeError("fixture_start_failure")
+            return real_create_task(coroutine, **kwargs)
+        monkeypatch.setattr(asyncio, "create_task", faulty_create_task)
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await MCPHandler.start_background_workers(settings=settings, vector_store=object(), client_manager=object())
+            assert MCPHandler._service_lock_guard is None
+            assert MCPHandler._retention_task is None and MCPHandler._worker_tasks == []
+            with observer.execution_locks.try_service() as acquired:
+                assert acquired
+            monkeypatch.setattr(asyncio, "create_task", real_create_task)
+            await MCPHandler.start_background_workers(settings=settings, vector_store=object(), client_manager=object())
+            assert MCPHandler._durable_runtime_ready
+        finally:
+            monkeypatch.setattr(asyncio, "create_task", real_create_task)
+            if MCPHandler._service_lock_guard is not None:
+                await MCPHandler.stop_background_workers()
+            store.close()
+            observer.close()
+    asyncio.run(scenario())
+
+
+def test_repeated_startup_cancellation_does_not_release_live_cleanup(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from server.database.durable_job_store import DurableJobStore
+    from server.mcp_handler import MCPHandler
+
+    async def scenario():
+        store = DurableJobStore(str(tmp_path / "queue.sqlite"))
+        observer = DurableJobStore(store.db_path)
+        settings = SimpleNamespace(memory_write_workers=1, memory_write_max_retries=6, memory_write_lease_seconds=90, memory_write_batch_max=1, memory_write_batch_max_wait_ms=10, memory_write_purge_interval_s=300, memory_write_retention_hours=24)
+        for name, value in (("_runtime_lock", None), ("_durable_store", store), ("_service_lock_guard", None), ("_durable_runtime_ready", False), ("_runtime_event_loop", None), ("_runtime_drained", None), ("_active_runtime_requests", 0), ("_worker_shutdown", None), ("_worker_tasks", []), ("_retention_task", None), ("_lease_recoveries", 0), ("_shared_fastpath_client", None)):
+            monkeypatch.setattr(MCPHandler, name, value)
+        class DelayedCancellation(asyncio.Future):
+            def cancel(self, msg=None):
+                return False
+        pending = DelayedCancellation()
+        entered = asyncio.Event()
+        calls = 0
+        real_create_task = asyncio.create_task
+        def faulty_create_task(coroutine, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                coroutine.close()
+                return pending
+            entered.set()
+            raise RuntimeError("fixture_start_failure")
+        monkeypatch.setattr(asyncio, "create_task", faulty_create_task)
+        startup = asyncio.get_running_loop().create_task(MCPHandler.start_background_workers(settings=settings, vector_store=object(), client_manager=object()))
+        try:
+            await entered.wait()
+            await asyncio.sleep(0)
+            for _ in range(2):
+                startup.cancel()
+                await asyncio.sleep(0)
+                assert not startup.done()
+                with observer.execution_locks.try_service() as acquired:
+                    assert not acquired
+            pending.set_result(None)
+            with pytest.raises(asyncio.CancelledError):
+                await startup
+            assert MCPHandler._service_lock_guard is None and MCPHandler._retention_task is None
+            with observer.execution_locks.try_service() as acquired:
+                assert acquired
+        finally:
+            if not pending.done():
+                pending.set_result(None)
+            await asyncio.gather(startup, return_exceptions=True)
+            monkeypatch.setattr(asyncio, "create_task", real_create_task)
+            if MCPHandler._service_lock_guard is not None:
+                await MCPHandler.stop_background_workers()
+            store.close()
+            observer.close()
+    asyncio.run(scenario())
