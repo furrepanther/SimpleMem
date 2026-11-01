@@ -106,6 +106,43 @@ def test_query_propagates_generator_failure_without_cache_or_unhandled_future():
     asyncio.run(exercise())
 
 
+def test_query_surfaces_real_answer_generator_upstream_failure():
+    async def exercise():
+        class FailingClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def chat_completion(self, **kwargs):
+                self.calls += 1
+                raise RuntimeError("fixture upstream failure")
+
+        client = FailingClient()
+        handler = make_handler(AnswerGenerator(client))
+        with pytest.raises(RuntimeError, match="answer generation failed"):
+            await handler._tool_memory_query({"question": "real generator failure"})
+        assert client.calls == 3
+        assert not MCPHandler._query_cache and not MCPHandler._query_inflight
+
+    asyncio.run(exercise())
+
+
+def test_query_preserves_a_legitimate_answer_matching_error_text():
+    async def exercise():
+        async def generate_answer(**kwargs):
+            return {
+                "answer": "An error occurred while generating the answer.",
+                "reasoning": "The source document quotes that sentence.",
+                "confidence": "high",
+            }
+
+        handler = make_handler(SimpleNamespace(generate_answer=generate_answer))
+        result = await handler._tool_memory_query({"question": "quoted error text"})
+        assert result["answer"] == "An error occurred while generating the answer."
+        assert result["confidence"] == "high"
+
+    asyncio.run(exercise())
+
+
 def test_query_uses_local_lancedb_hit_and_empty_controls(tmp_path):
     async def exercise():
         class FakeEmbedding:

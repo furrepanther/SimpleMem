@@ -1928,20 +1928,11 @@ class MCPHandler:
 
             answer_result = await generator.generate_answer(query=question, contexts=contexts)
             answer_text = str(answer_result.get("answer", ""))
-            reasoning_text = str(answer_result.get("reasoning", ""))
-            if "error occurred while generating the answer" in answer_text.lower():
-                snippets = [
-                    str(e.lossless_restatement or "").strip()
-                    for e in contexts[:3]
-                    if str(e.lossless_restatement or "").strip()
-                ]
-                if snippets:
-                    fallback = " | ".join(snippets)
-                    answer_result = {
-                        "answer": fallback[:700],
-                        "reasoning": f"Fallback summary from memory_retrieve contexts. Original synthesis failure: {reasoning_text[:220]}",
-                        "confidence": "low",
-                    }
+            if (
+                answer_text == "An error occurred while generating the answer."
+                and str(answer_result.get("reasoning", "")).startswith("Error:")
+            ):
+                raise RuntimeError("memory_query answer generation failed")
 
             result = {
                 "question": question,
