@@ -83,3 +83,77 @@ def test_invalid_generation_failure_reaches_coalesced_waiters_without_orphan_err
             loop.set_exception_handler(previous)
             MCPHandler._invalidate_memory_caches()
     asyncio.run(exercise())
+
+
+def test_actual_transport_failure_releases_read_permit_and_is_not_success_cached():
+    import httpx
+    from server.integrations.openrouter import OpenRouterClient
+    async def exercise():
+        requests = []
+        def failed_read(request):
+            requests.append(request)
+            raise httpx.ReadTimeout("synthetic failed transport", request=request)
+        client = OpenRouterClient(api_key="fixture", base_url="http://127.0.0.1:9/v1",
+                                  llm_model="granite-4.0-h-1b-Q4_K_S:latest")
+        configured = client._get_chat_client()
+        timeout = configured.timeout
+        assert timeout.read == 120.0
+        await configured.aclose()
+        client._chat_client = httpx.AsyncClient(base_url=client.base_url,
+                                               transport=httpx.MockTransport(failed_read), timeout=timeout)
+        handler = make_handler(AnswerGenerator(client))
+        before = MCPHandler._active_read_ops
+        try:
+            with pytest.raises(httpx.ReadTimeout, match="synthetic failed transport"):
+                await handler._tool_memory_query({"question": "transport failure fixture"})
+            assert len(requests) == 3 and MCPHandler._active_read_ops == before
+            assert not MCPHandler._query_inflight and not MCPHandler._query_cache
+        finally:
+            await client.close()
+            MCPHandler._invalidate_memory_caches()
+    asyncio.run(exercise())
+
+
+def test_real_generator_explicit_cancellation_releases_owner_waiter_and_read_permit():
+    async def exercise():
+        started = asyncio.Event()
+        class HeldClient(ParsedReplyClient):
+            async def chat_completion(self, **kwargs):
+                self.requests.append(kwargs)
+                started.set()
+                await asyncio.Event().wait()
+        client = HeldClient(None)
+        handler = make_handler(AnswerGenerator(client))
+        before = MCPHandler._active_read_ops
+        owner = asyncio.create_task(handler._tool_memory_query({"question": "explicit cancellation fixture"}))
+        await started.wait()
+        waiter = asyncio.create_task(handler._tool_memory_query({"question": "explicit cancellation fixture"}))
+        await asyncio.sleep(0)
+        owner.cancel()
+        results = await asyncio.gather(owner, waiter, return_exceptions=True)
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+        assert len(client.requests) == 1 and MCPHandler._active_read_ops == before
+        assert not MCPHandler._query_inflight and not MCPHandler._query_cache
+        MCPHandler._invalidate_memory_caches()
+    asyncio.run(exercise())
+
+
+def test_generation_failure_through_actual_jsonrpc_retains_id_and_same_query_recovers():
+    import json
+    async def exercise():
+        client = ParsedReplyClient(None)
+        handler = make_handler(AnswerGenerator(client))
+        handler.initialized = True
+        request = {"jsonrpc": "2.0", "id": 47, "method": "tools/call",
+                   "params": {"name": "memory_query", "arguments": {"question": "wire error fixture"}}}
+        result = json.loads(await handler.handle_message(json.dumps(request)))
+        assert result["id"] == 47 and result["error"]["code"] == -32603
+        assert not MCPHandler._query_inflight and not MCPHandler._query_cache
+        client.data = {"answer": "wire recovered", "confidence": "high"}
+        request["id"] = 48
+        recovered = json.loads(await handler.handle_message(json.dumps(request)))
+        assert recovered["id"] == 48 and "error" not in recovered
+        body = json.loads(recovered["result"]["content"][0]["text"])
+        assert body["answer"] == "wire recovered"
+        MCPHandler._invalidate_memory_caches()
+    asyncio.run(exercise())
