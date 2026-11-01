@@ -1019,3 +1019,45 @@ def test_health_distinguishes_quarantined_jobs_from_unavailable_queue(tmp_path):
         assert health["queue_state"] == "unavailable"
     finally:
         store.close()
+
+
+def test_reopening_queue_backfills_legacy_checkpoint_and_raw_entry_guards(tmp_path):
+    import uuid
+    from server.database.durable_job_store import DurableJobStore
+    db = str(tmp_path / "queue.sqlite")
+    store = DurableJobStore(db)
+    try:
+        generated = store.enqueue_or_get(user_id="fixture", kind="memory_add", idempotency_key="generated", payload={"user_id": "fixture", "table_name": "t", "content": "fixture"}, max_inflight_writes=10)["job_id"]
+        raw = store.enqueue_or_get(user_id="fixture", kind="memory_store", idempotency_key="raw", payload={"user_id": "fixture", "table_name": "t", "content": "fixture"}, max_inflight_writes=10)["job_id"]
+        with store.claim_locked_batch(worker_id="old", batch_size=2, lease_seconds=5) as jobs:
+            assert {job["job_id"] for job in jobs} == {generated, raw}
+            store.save_checkpoint(job_id=generated, lease_owner="old", window_index=0, input_hash="fixture", entries=[{"entry_id": "legacy-id"}])
+        assert not store.has_pending_entry("t", "legacy-id")
+    finally:
+        store.close()
+    reopened = DurableJobStore(db)
+    try:
+        raw_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"simplemem:fixture:{raw}:raw"))
+        assert reopened.has_pending_entry("t", "legacy-id")
+        assert reopened.has_pending_entry("t", raw_id)
+        assert not reopened.has_pending_entry("other-table", "legacy-id")
+    finally:
+        reopened.close()
+
+
+def test_invalid_retained_checkpoint_fails_closed_without_deleting_job(tmp_path):
+    from server.database.durable_job_store import CheckpointIntegrityError, DurableJobStore
+    db = str(tmp_path / "queue.sqlite")
+    store = DurableJobStore(db)
+    try:
+        job_id = store.enqueue_or_get(user_id="fixture", kind="memory_add", idempotency_key="key", payload={"user_id": "fixture", "table_name": "t"}, max_inflight_writes=10)["job_id"]
+        with store.claim_locked_batch(worker_id="old", batch_size=1, lease_seconds=5) as jobs:
+            assert jobs
+            store._get_connection().execute("INSERT INTO durable_job_checkpoints(job_id, window_index, input_hash, entries_json) VALUES (?, 0, 'fixture', ?)", (job_id, "not-json"))
+    finally:
+        store.close()
+    with pytest.raises(CheckpointIntegrityError, match="invalid retained checkpoint"):
+        DurableJobStore(db)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT status FROM durable_jobs WHERE job_id = ?", (job_id,)).fetchone()[0] == "processing"
+        assert conn.execute("SELECT entries_json FROM durable_job_checkpoints WHERE job_id = ?", (job_id,)).fetchone()[0] == "not-json"

@@ -54,6 +54,53 @@ class DurableJobStore:
             os.makedirs(parent, exist_ok=True)
         self._init_db()
         self.execution_locks = JobExecutionLocks(db_path, self._get_connection())
+        self._backfill_replayable_entries()
+
+    def _backfill_replayable_entries(self) -> None:
+        """Index retained unfinished checkpoints before deletion can be served."""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT j.job_id, j.kind, j.payload_json, c.entries_json
+                    FROM durable_jobs j
+                    LEFT JOIN durable_job_checkpoints c ON c.job_id = j.job_id
+                    WHERE j.status IN ('pending', 'processing', 'failed_retryable', 'quarantined')
+                      AND (j.kind = 'memory_store' OR c.entries_json IS NOT NULL)
+                    """
+                )
+                while True:
+                    batch = rows.fetchmany(128)
+                    if not batch:
+                        break
+                    refs = []
+                    for row in batch:
+                        try:
+                            payload = json.loads(row["payload_json"])
+                            entries = json.loads(row["entries_json"]) if row["entries_json"] is not None else []
+                        except json.JSONDecodeError as exc:
+                            raise CheckpointIntegrityError("invalid retained checkpoint or payload JSON") from exc
+                        if not isinstance(payload, dict) or not isinstance(entries, list):
+                            raise CheckpointIntegrityError("invalid retained checkpoint or payload")
+                        table_name = payload.get("table_name")
+                        if entries and (not isinstance(table_name, str) or not table_name):
+                            raise CheckpointIntegrityError("retained checkpoint has no table identity")
+                        for entry in entries:
+                            if not isinstance(entry, dict) or not isinstance(entry.get("entry_id"), str) or not entry["entry_id"]:
+                                raise CheckpointIntegrityError("invalid retained checkpoint entry identity")
+                            refs.append((str(row["job_id"]), table_name, entry["entry_id"]))
+                        user_id = payload.get("user_id")
+                        if row["kind"] == "memory_store" and isinstance(table_name, str) and table_name and isinstance(user_id, str) and user_id.strip():
+                            raw_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"simplemem:{user_id.strip()}:{row['job_id']}:raw"))
+                            refs.append((str(row["job_id"]), table_name, raw_id))
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO durable_job_entries(job_id, table_name, entry_id) VALUES (?, ?, ?)", refs
+                    )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
 
     @staticmethod
     def _utc_now() -> datetime:
