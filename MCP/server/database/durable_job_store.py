@@ -19,6 +19,10 @@ from typing import Any, Optional
 from .execution_lock import JobExecutionLocks
 
 
+class CheckpointIntegrityError(RuntimeError):
+    """A durable checkpoint cannot safely be replayed without inspection."""
+
+
 _CLAIM_CANDIDATES_SQL = """
 SELECT job_id, user_id, kind, idempotency_key, payload_json, status, attempt_count,
        available_at_utc, created_at_utc, updated_at_utc
@@ -31,7 +35,9 @@ FROM (
     FROM durable_jobs
     WHERE status IN ('pending', 'failed_retryable') AND available_at_utc <= ?
 )
-WHERE user_rank <= ? ORDER BY created_at_utc ASC, job_id ASC LIMIT ?
+WHERE user_rank <= ?
+  AND (? IS NULL OR created_at_utc > ? OR (created_at_utc = ? AND job_id > ?))
+ORDER BY created_at_utc ASC, job_id ASC LIMIT ?
 """
 
 
@@ -42,6 +48,7 @@ class DurableJobStore:
         self.db_path = db_path
         self._init_lock = threading.Lock()
         self._local = threading.local()
+        self._claim_scan_cursor: tuple[str, str] | None = None
         parent = os.path.dirname(db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -71,6 +78,7 @@ class DurableJobStore:
         conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA busy_timeout=30000")
         self._local.conn = conn
@@ -110,6 +118,18 @@ class DurableJobStore:
                         result_json TEXT,
                         created_at_utc TEXT NOT NULL,
                         updated_at_utc TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS durable_job_checkpoints (
+                        job_id TEXT NOT NULL,
+                        window_index INTEGER NOT NULL,
+                        input_hash TEXT NOT NULL,
+                        entries_json TEXT NOT NULL,
+                        PRIMARY KEY(job_id, window_index),
+                        FOREIGN KEY(job_id) REFERENCES durable_jobs(job_id) ON DELETE CASCADE
                     )
                     """
                 )
@@ -260,70 +280,73 @@ class DurableJobStore:
                 conn.execute("ROLLBACK")
                 raise
 
-    def claim_batch(
-        self,
-        *,
-        worker_id: str,
-        batch_size: int,
-        lease_seconds: int,
-        max_jobs_per_user: int = 4,
-    ) -> list[dict[str, Any]]:
-        now = self._utc_now()
-        now_iso = now.isoformat()
-        lease_expires_iso = (
-            now + timedelta(seconds=max(5, int(lease_seconds)))
-        ).isoformat()
-        take = max(1, int(batch_size))
+    def load_checkpoint(
+        self, *, job_id: str, lease_owner: str, window_index: int, input_hash: str
+    ) -> list[dict[str, Any]] | None:
+        """Load a generated window only while this worker owns the job."""
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT c.input_hash, c.entries_json FROM durable_jobs j
+                LEFT JOIN durable_job_checkpoints c
+                  ON c.job_id = j.job_id AND c.window_index = ?
+                WHERE j.job_id = ? AND j.status = 'processing' AND j.lease_owner = ?
+                """,
+                (window_index, job_id, lease_owner),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("durable_job_lease_lost_before_checkpoint")
+            if row["entries_json"] is None:
+                return None
+            if row["input_hash"] != input_hash:
+                raise CheckpointIntegrityError("durable_checkpoint_input_mismatch")
+            try:
+                entries = json.loads(row["entries_json"])
+            except json.JSONDecodeError as exc:
+                raise CheckpointIntegrityError("invalid durable job checkpoint JSON") from exc
+            if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+                raise CheckpointIntegrityError("invalid durable job checkpoint")
+            return entries
 
+    def save_checkpoint(
+        self, *, job_id: str, lease_owner: str, window_index: int, input_hash: str, entries: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Persist the first generated window before any corresponding Lance write."""
+        payload = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                rows = conn.execute(
-                    _CLAIM_CANDIDATES_SQL, (now_iso, max(1, int(max_jobs_per_user)), take)
-                ).fetchall()
-                if not rows:
-                    conn.execute("COMMIT")
-                    return []
-
-                out: list[dict[str, Any]] = []
-                for row in rows:
-                    job_id = str(row["job_id"])
-                    conn.execute(
-                        """
-                        UPDATE durable_jobs
-                        SET status = 'processing',
-                            lease_owner = ?,
-                            lease_expires_at_utc = ?,
-                            updated_at_utc = ?
-                        WHERE job_id = ?
-                        """,
-                        (worker_id, lease_expires_iso, now_iso, job_id),
-                    )
-                    payload_raw = str(row["payload_json"])
-                    try:
-                        payload = json.loads(payload_raw)
-                    except json.JSONDecodeError:
-                        payload = {"_corrupt_payload": True, "_raw": payload_raw}
-                    out.append(
-                        {
-                            "job_id": job_id,
-                            "user_id": str(row["user_id"]),
-                            "kind": str(row["kind"]),
-                            "idempotency_key": str(row["idempotency_key"]),
-                            "payload": payload,
-                            "status": str(row["status"]),
-                            "attempt_count": int(row["attempt_count"]),
-                            "lease_owner": worker_id,
-                            "available_at_utc": str(row["available_at_utc"]),
-                            "created_at_utc": str(row["created_at_utc"]),
-                            "updated_at_utc": str(row["updated_at_utc"]),
-                        }
-                    )
+                owner = conn.execute(
+                    "SELECT 1 FROM durable_jobs WHERE job_id = ? AND status = 'processing' AND lease_owner = ?",
+                    (job_id, lease_owner),
+                ).fetchone()
+                if owner is None:
+                    raise RuntimeError("durable_job_lease_lost_before_checkpoint")
+                conn.execute(
+                    "INSERT OR IGNORE INTO durable_job_checkpoints(job_id, window_index, input_hash, entries_json) VALUES (?, ?, ?, ?)",
+                    (job_id, window_index, input_hash, payload),
+                )
+                row = conn.execute(
+                    "SELECT input_hash, entries_json FROM durable_job_checkpoints WHERE job_id = ? AND window_index = ?",
+                    (job_id, window_index),
+                ).fetchone()
+                if row["input_hash"] != input_hash:
+                    raise CheckpointIntegrityError("durable_checkpoint_input_mismatch")
+                try:
+                    result = json.loads(row["entries_json"])
+                except json.JSONDecodeError as exc:
+                    raise CheckpointIntegrityError("invalid durable job checkpoint JSON") from exc
+                if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
+                    raise CheckpointIntegrityError("invalid durable job checkpoint")
                 conn.execute("COMMIT")
-                return out
-            except Exception:
+                return result
+            except BaseException:
                 conn.execute("ROLLBACK")
                 raise
+
+    def claim_batch(self, **_kwargs):
+        """Reject legacy claims that cannot retain the required execution locks."""
+        raise RuntimeError("unlocked job claims are disabled; use claim_locked_batch")
 
     @contextmanager
     def claim_locked_batch(
@@ -339,14 +362,42 @@ class DurableJobStore:
         now_iso = now.isoformat()
         take = max(1, int(batch_size))
         with self._connection() as conn:
-            candidates = conn.execute(
-                _CLAIM_CANDIDATES_SQL, (now_iso, max(1, int(max_jobs_per_user)), take)
-            ).fetchall()
+            # Always revisit the oldest page and scan one additional page past
+            # a stable keyset cursor, so locked heads cannot starve later jobs.
+            page_size = max(64, take)
+            user_limit = max(1, int(max_jobs_per_user))
+            def page(cursor):
+                created, job_id = cursor if cursor is not None else (None, None)
+                return conn.execute(
+                    _CLAIM_CANDIDATES_SQL,
+                    (now_iso, user_limit, created, created, created, job_id, page_size),
+                ).fetchall()
             with ExitStack() as held_locks:
                 locked = []
-                for row in candidates:
+                seen = set()
+                front = page(None)
+                for row in front:
+                    seen.add(str(row["job_id"]))
                     if held_locks.enter_context(self.execution_locks.try_job(str(row["job_id"]))):
                         locked.append(row)
+                        if len(locked) >= take:
+                            break
+                if len(locked) < take and front:
+                    cursor = self._claim_scan_cursor or (str(front[-1]["created_at_utc"]), str(front[-1]["job_id"]))
+                    following = page(cursor)
+                    examined = None
+                    for row in following:
+                        examined = (str(row["created_at_utc"]), str(row["job_id"]))
+                        if str(row["job_id"]) in seen:
+                            continue
+                        if held_locks.enter_context(self.execution_locks.try_job(str(row["job_id"]))):
+                            locked.append(row)
+                            if len(locked) >= take:
+                                break
+                    if not following or (examined == (str(following[-1]["created_at_utc"]), str(following[-1]["job_id"])) and len(following) < page_size):
+                        self._claim_scan_cursor = None
+                    elif examined is not None:
+                        self._claim_scan_cursor = examined
                 if not locked:
                     yield []
                     return
@@ -515,6 +566,20 @@ class DurableJobStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    def quarantine_checkpoint(self, *, job_id: str, lease_owner: str, error: str) -> bool:
+        """Preserve unsafe-to-replay jobs outside automatic retries and retention."""
+        with self._connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE durable_jobs
+                SET status = 'quarantined', lease_owner = NULL,
+                    lease_expires_at_utc = NULL, last_error = ?, updated_at_utc = ?
+                WHERE job_id = ? AND status = 'processing' AND lease_owner = ?
+                """,
+                (error[:5000], self._utc_now_iso(), job_id, lease_owner),
+            )
+            return cur.rowcount == 1
+
     def get_job(self, *, job_id: str) -> dict[str, Any] | None:
         with self._connection() as conn:
             row = conn.execute(
@@ -675,6 +740,7 @@ class DurableJobStore:
                 "done": counts.get("done", 0),
                 "failed_retryable": counts.get("failed_retryable", 0),
                 "failed_terminal": counts.get("failed_terminal", 0),
+                "quarantined": counts.get("quarantined", 0),
                 "oldest_pending_age_s": round(oldest_pending_age_s, 3),
             }
 
@@ -702,19 +768,40 @@ class DurableJobStore:
             return int(cur.rowcount or 0)
 
     def cancel_jobs_for_user(self, user_id: str) -> int:
+        """Delete a user's unfinished jobs only after their effects are idle.
+
+        Callers must revoke new submissions before invoking this operation.
+        Quarantined jobs are included only because this is an explicit user
+        cancellation; ordinary retention never deletes them.
+        """
+        active = ("pending", "failed_retryable", "processing", "quarantined")
         with self._connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                cur = conn.execute(
-                    """
-                    DELETE FROM durable_jobs
-                    WHERE user_id = ?
-                      AND status IN ('pending', 'failed_retryable', 'processing')
-                    """,
-                    (user_id,),
-                )
-                conn.execute("COMMIT")
-                return int(cur.rowcount or 0)
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
+            rows = conn.execute(
+                "SELECT job_id FROM durable_jobs WHERE user_id = ? AND status IN (?, ?, ?, ?) ORDER BY job_id",
+                (user_id, *active),
+            ).fetchall()
+            expected = {str(row["job_id"]) for row in rows}
+            with ExitStack() as locks:
+                for job_id in sorted(expected):
+                    if not locks.enter_context(self.execution_locks.try_job(job_id)):
+                        raise RuntimeError("user_has_active_durable_job")
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    current = {
+                        str(row["job_id"])
+                        for row in conn.execute(
+                            "SELECT job_id FROM durable_jobs WHERE user_id = ? AND status IN (?, ?, ?, ?)",
+                            (user_id, *active),
+                        ).fetchall()
+                    }
+                    if current != expected:
+                        raise RuntimeError("user_durable_jobs_changed_during_cancellation")
+                    cur = conn.execute(
+                        "DELETE FROM durable_jobs WHERE user_id = ? AND status IN (?, ?, ?, ?)",
+                        (user_id, *active),
+                    )
+                    conn.execute("COMMIT")
+                    return int(cur.rowcount or 0)
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise

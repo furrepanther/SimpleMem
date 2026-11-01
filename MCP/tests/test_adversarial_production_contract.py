@@ -16,6 +16,12 @@ from server.mcp_handler import MCPHandler
 from server.integrations.openrouter import OpenRouterClient
 
 
+def _claim_abandoned_fixture(store, **kwargs):
+    """Simulate claims whose owner has already lost its execution locks."""
+    with store.claim_locked_batch(**kwargs) as jobs:
+        return jobs
+
+
 def test_settings_fail_closed_when_jwt_secret_is_empty(tmp_path) -> None:
     with pytest.raises(ValueError, match="JWT_SECRET_KEY"):
         Settings(
@@ -113,7 +119,7 @@ def test_durable_queue_recovers_expired_processing_lease(tmp_path) -> None:
         payload={"content": "durable"},
         max_inflight_writes=10,
     )
-    claimed = store.claim_batch(worker_id="worker-a", batch_size=1, lease_seconds=5)
+    claimed = _claim_abandoned_fixture(store, worker_id="worker-a", batch_size=1, lease_seconds=5)
     assert claimed and claimed[0]["job_id"] == queued["job_id"]
 
     with sqlite3.connect(db_path) as conn:
@@ -139,14 +145,14 @@ def test_durable_queue_fences_stale_lease_completion(tmp_path) -> None:
         payload={"content": "durable"},
         max_inflight_writes=10,
     )
-    stale = store.claim_batch(worker_id="worker-a", batch_size=1, lease_seconds=5)[0]
+    stale = _claim_abandoned_fixture(store, worker_id="worker-a", batch_size=1, lease_seconds=5)[0]
     with sqlite3.connect(store.db_path) as conn:
         conn.execute(
             "UPDATE durable_jobs SET lease_expires_at_utc = ? WHERE job_id = ?",
             ("2000-01-01T00:00:00+00:00", queued["job_id"]),
         )
     assert store.recover_expired_leases(max_retries=6) == 1
-    current = store.claim_batch(worker_id="worker-b", batch_size=1, lease_seconds=5)[0]
+    current = _claim_abandoned_fixture(store, worker_id="worker-b", batch_size=1, lease_seconds=5)[0]
     assert store.mark_done(
         job_id=queued["job_id"],
         lease_owner=stale["lease_owner"],
@@ -170,7 +176,7 @@ def test_durable_queue_failed_write_is_retryable_and_reclaimable(tmp_path) -> No
         payload={"content": "durable"},
         max_inflight_writes=10,
     )
-    claimed = store.claim_batch(
+    claimed = _claim_abandoned_fixture(store,
         worker_id="failed-worker", batch_size=1, lease_seconds=5
     )[0]
 
@@ -190,7 +196,7 @@ def test_durable_queue_failed_write_is_retryable_and_reclaimable(tmp_path) -> No
             ("2000-01-01T00:00:00+00:00", queued["job_id"]),
         )
 
-    retry = store.claim_batch(
+    retry = _claim_abandoned_fixture(store,
         worker_id="retry-worker", batch_size=1, lease_seconds=5
     )[0]
     assert retry["job_id"] == queued["job_id"]
@@ -240,7 +246,7 @@ def test_durable_queue_claims_are_fair_across_users(tmp_path) -> None:
         payload={"content": "b"},
         max_inflight_writes=20,
     )
-    claimed = store.claim_batch(
+    claimed = _claim_abandoned_fixture(store,
         worker_id="fair-worker", batch_size=5, lease_seconds=5, max_jobs_per_user=2
     )
     assert {job["user_id"] for job in claimed} == {"user-a", "user-b"}
@@ -263,7 +269,7 @@ def test_durable_queue_purge_removes_only_old_terminal_jobs(tmp_path) -> None:
         payload={"content": "pending"},
         max_inflight_writes=10,
     )
-    claimed = store.claim_batch(worker_id="purge-test", batch_size=2, lease_seconds=5)
+    claimed = _claim_abandoned_fixture(store, worker_id="purge-test", batch_size=2, lease_seconds=5)
     done_claim = next(job for job in claimed if job["job_id"] == done["job_id"])
     assert store.mark_done(
         job_id=done["job_id"],
@@ -292,7 +298,7 @@ def test_durable_queue_retention_boundary_is_explicit(tmp_path) -> None:
             payload={"content": key},
             max_inflight_writes=10,
         )
-        claimed = store.claim_batch(
+        claimed = _claim_abandoned_fixture(store,
             worker_id=f"retention-{key}", batch_size=1, lease_seconds=5
         )[0]
         assert store.mark_done(
@@ -710,7 +716,7 @@ def test_lease_recovery_retries_unprocessed_rows_after_partial_failure(tmp_path)
     for user in ("user-a", "user-b"):
         store.enqueue_or_get(user_id=user, kind="memory_store", idempotency_key=user,
                              payload={"content": user}, max_inflight_writes=10)
-    claimed = store.claim_batch(worker_id="fixture", batch_size=2, lease_seconds=5)
+    claimed = _claim_abandoned_fixture(store, worker_id="fixture", batch_size=2, lease_seconds=5)
     assert len(claimed) == 2
     conn = store._get_connection()
     conn.execute("UPDATE durable_jobs SET lease_expires_at_utc = '2000-01-01T00:00:00+00:00'")
@@ -845,7 +851,7 @@ def test_lease_recovery_process_crash_preserves_fencing(tmp_path) -> None:
         )["job_id"]
         for user in ("fixture-a", "fixture-b")
     ]
-    assert len(store.claim_batch(worker_id="old-worker", batch_size=2, lease_seconds=5)) == 2
+    assert len(_claim_abandoned_fixture(store, worker_id="old-worker", batch_size=2, lease_seconds=5)) == 2
     conn = store._get_connection()
     conn.execute("UPDATE durable_jobs SET lease_expires_at_utc = '2000-01-01T00:00:00+00:00'")
     rows = conn.execute(
@@ -878,7 +884,7 @@ raise SystemExit(99)
         assert store.get_job(job_id=second)["status"] == "processing"
         conn.execute("DROP TRIGGER fixture_crash")
         assert store.recover_expired_leases() == 1
-        claimed = store.claim_batch(worker_id="new-worker", batch_size=2, lease_seconds=5)
+        claimed = _claim_abandoned_fixture(store, worker_id="new-worker", batch_size=2, lease_seconds=5)
         assert {job["job_id"] for job in claimed} == set(job_ids)
         for job_id in job_ids:
             assert not store.mark_done(job_id=job_id, lease_owner="old-worker", result={"stale": True})
@@ -893,10 +899,10 @@ def test_pre_execution_fence_rejects_a_reassigned_job(tmp_path, monkeypatch) -> 
     store = DurableJobStore(str(tmp_path / "pre-execution-fence.db"))
     try:
         job_id = store.enqueue_or_get(user_id="fixture", kind="memory_store", idempotency_key="key", payload={"content": "fixture"}, max_inflight_writes=10)["job_id"]
-        stale = store.claim_batch(worker_id="old", batch_size=1, lease_seconds=5)[0]
+        stale = _claim_abandoned_fixture(store, worker_id="old", batch_size=1, lease_seconds=5)[0]
         store._get_connection().execute("UPDATE durable_jobs SET lease_expires_at_utc = '2000-01-01T00:00:00+00:00' WHERE job_id = ?", (job_id,))
         assert store.recover_expired_leases() == 1
-        assert store.claim_batch(worker_id="new", batch_size=1, lease_seconds=5)
+        assert _claim_abandoned_fixture(store, worker_id="new", batch_size=1, lease_seconds=5)
         called = []
         async def execute_fixture(cls, job):
             called.append(job)

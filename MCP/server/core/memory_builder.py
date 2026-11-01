@@ -9,12 +9,14 @@ Converts raw dialogues into atomic memory entries through:
 Simplified: Direct processing without buffering.
 """
 
+import hashlib
 import json
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 from datetime import datetime, timezone
 import uuid
 
 from ..auth.models import MemoryEntry, Dialogue
+from ..database.durable_job_store import CheckpointIntegrityError
 from ..database.vector_store import MultiTenantVectorStore
 
 # Type alias for LLM client (duck-typed OpenRouter-compatible client).
@@ -37,6 +39,8 @@ class MemoryBuilder:
         temperature: float = 0.1,
         max_retries: int = 3,
         entry_id_namespace: str = "",
+        checkpoint_loader: Optional[Callable[[int, str], Optional[list[dict[str, Any]]]]] = None,
+        checkpoint_saver: Optional[Callable[[int, str, list[dict[str, Any]]], list[dict[str, Any]]]] = None,
     ):
         self.client = llm_client
         self.vector_store = vector_store
@@ -46,6 +50,10 @@ class MemoryBuilder:
         self.temperature = temperature
         self.max_retries = max(1, int(max_retries))
         self.entry_id_namespace = str(entry_id_namespace or "").strip()
+        if (checkpoint_loader is None) != (checkpoint_saver is None):
+            raise ValueError("checkpoint loader and saver must be provided together")
+        self._checkpoint_loader = checkpoint_loader
+        self._checkpoint_saver = checkpoint_saver
 
         # Context from previous processing for deduplication
         self._previous_context: str = ""
@@ -78,7 +86,10 @@ class MemoryBuilder:
         )
 
         # Process immediately
-        entries = await self._generate_memory_entries([dialogue])
+        input_hash = self._checkpoint_input_hash({
+            "kind": "single", "speaker": speaker, "content": content, "timestamp": timestamp or None,
+        }) if self._checkpoint_loader is not None else ""
+        entries = await self._entries_for_window([dialogue], 0, input_hash)
 
         if not entries:
             return {
@@ -150,7 +161,16 @@ class MemoryBuilder:
         for i in range(0, len(dialogue_objects), self.window_size):
             window = dialogue_objects[i : i + self.window_size]
 
-            entries = await self._generate_memory_entries(window)
+            raw_window = dialogues[i : i + self.window_size]
+            input_hash = self._checkpoint_input_hash({
+                "kind": "batch", "window_size": self.window_size,
+                "dialogues": [
+                    {"speaker": item.get("speaker", ""), "content": item.get("content", ""),
+                     "timestamp": item.get("timestamp") or None}
+                    for item in raw_window
+                ],
+            }) if self._checkpoint_loader is not None else ""
+            entries = await self._entries_for_window(window, i // self.window_size, input_hash)
 
             if entries:
                 # Generate embeddings
@@ -174,6 +194,41 @@ class MemoryBuilder:
             "added": len(dialogues),
             "entries_created": total_entries,
         }
+
+    @staticmethod
+    def _checkpoint_input_hash(value: dict[str, Any]) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _decode_checkpoint(entries: list[dict[str, Any]]) -> List[MemoryEntry]:
+        expected = {"entry_id", "lossless_restatement", "keywords", "timestamp", "location", "persons", "entities", "topic"}
+        if not isinstance(entries, list):
+            raise CheckpointIntegrityError("invalid durable memory checkpoint")
+        decoded = []
+        for item in entries:
+            if (
+                not isinstance(item, dict)
+                or set(item) != expected
+                or not isinstance(item["entry_id"], str)
+                or not item["entry_id"]
+                or not isinstance(item["lossless_restatement"], str)
+                or not item["lossless_restatement"].strip()
+            ):
+                raise CheckpointIntegrityError("invalid durable memory checkpoint entry")
+            decoded.append(MemoryEntry.from_dict(item))
+        return decoded
+
+    async def _entries_for_window(self, dialogues: List[Dialogue], window_index: int, input_hash: str) -> List[MemoryEntry]:
+        if self._checkpoint_loader is not None:
+            saved = self._checkpoint_loader(window_index, input_hash)
+            if saved is not None:
+                return self._decode_checkpoint(saved)
+        entries = await self._generate_memory_entries(dialogues)
+        if self._checkpoint_saver is None:
+            return entries
+        saved = self._checkpoint_saver(window_index, input_hash, [entry.to_dict() for entry in entries])
+        return self._decode_checkpoint(saved)
 
     async def _generate_memory_entries(
         self,

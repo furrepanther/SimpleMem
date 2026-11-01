@@ -116,14 +116,21 @@ class JobExecutionLocks:
         finally:
             os.close(fd)
 
+    def try_job(self, job_id: str):
+        return self._try_offset(_job_offset(job_id))
+
+    def try_service(self):
+        """Reserve offset zero for the single Lance-writing service process."""
+        return self._try_offset(0)
+
     @contextmanager
-    def try_job(self, job_id: str) -> Iterator[bool]:
+    def _try_offset(self, offset: int) -> Iterator[bool]:
         fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
         try:
             info = _checked_file(fd, self.path)
             if info.st_ino != self.inode or os.pread(fd, 128, 0).decode("ascii") != self.token:
                 raise RuntimeError("durable execution lock file was replaced")
-            request = _Flock(fcntl.F_WRLCK, os.SEEK_SET, _job_offset(job_id), 1, 0)
+            request = _Flock(fcntl.F_WRLCK, os.SEEK_SET, offset, 1, 0)
             try:
                 fcntl.fcntl(fd, fcntl.F_OFD_SETLK, bytes(request))
                 acquired = True

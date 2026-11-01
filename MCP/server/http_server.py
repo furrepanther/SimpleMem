@@ -351,30 +351,21 @@ async def lifespan(app: FastAPI):
     # Start session cleanup task
     cleanup_task = asyncio.create_task(session_cleanup_task())
 
-    yield
-
-    cleanup_task.cancel()
     try:
-        await cleanup_task
-    except asyncio.CancelledError:
-        pass
-
-    if _default_executor is not None:
-        _default_executor.shutdown(wait=False, cancel_futures=True)
-        _default_executor = None
-
-    for task in MCPHandler._worker_tasks:
-        task.cancel()
-    for task in MCPHandler._worker_tasks:
+        yield
+    finally:
+        cleanup_task.cancel()
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+            await cleanup_task
+        except asyncio.CancelledError:
             pass
-    MCPHandler._worker_tasks.clear()
 
-    await MCPHandler.stop_background_workers()
-
-    print("SimpleMem MCP Server stopped")
+        # Do not cancel accepted jobs or their storage threads on elapsed time.
+        await MCPHandler.stop_background_workers()
+        if _default_executor is not None:
+            _default_executor.shutdown(wait=True, cancel_futures=False)
+            _default_executor = None
+        print("SimpleMem MCP Server stopped")
 
 
 # === Rate Limiter ===

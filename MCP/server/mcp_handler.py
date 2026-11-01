@@ -24,7 +24,7 @@ from .auth.models import User, MemoryEntry
 from .core.answer_generator import AnswerGenerator
 from .core.memory_builder import MemoryBuilder
 from .core.retriever import Retriever
-from .database.durable_job_store import DurableJobStore
+from .database.durable_job_store import CheckpointIntegrityError, DurableJobStore
 from .database.vector_store import MultiTenantVectorStore
 
 # Type alias for client manager (OpenRouter-compatible client manager)
@@ -73,6 +73,7 @@ class MCPHandler:
     _read_rejects: int = 0
 
     _durable_store: Optional[DurableJobStore] = None
+    _service_lock_guard: Optional[Any] = None
     _shared_settings: Optional[Any] = None
     _shared_vector_store: Optional[MultiTenantVectorStore] = None
     _shared_client_manager: Optional[ClientManager] = None
@@ -234,6 +235,12 @@ class MCPHandler:
                 cls._shared_token_manager = token_manager
             if cls._durable_store is None:
                 cls._durable_store = DurableJobStore(settings.durable_queue_db_path)
+            if cls._service_lock_guard is None:
+                guard = cls._durable_store.execution_locks.try_service()
+                if not guard.__enter__():
+                    guard.__exit__(None, None, None)
+                    raise RuntimeError("simplemem_service_already_running_for_queue")
+                cls._service_lock_guard = guard
             cls._lease_recoveries += cls._durable_store.recover_expired_leases(
                 max_retries=max(1, int(settings.memory_write_max_retries))
             )
@@ -261,21 +268,21 @@ class MCPHandler:
         async with cls._runtime_lock:
             if cls._worker_shutdown is not None:
                 cls._worker_shutdown.set()
-            if cls._shared_fastpath_client is not None:
-                try:
-                    await cls._shared_fastpath_client.aclose()
-                except Exception:
-                    pass
-                cls._shared_fastpath_client = None
             if cls._retention_task is not None:
                 cls._retention_task.cancel()
                 await asyncio.gather(cls._retention_task, return_exceptions=True)
                 cls._retention_task = None
-            for task in cls._worker_tasks:
-                task.cancel()
+            # Accepted jobs and their mutation threads must finish before their
+            # batch locks or shared clients are released.
             if cls._worker_tasks:
-                await asyncio.gather(*cls._worker_tasks, return_exceptions=True)
+                await asyncio.gather(*cls._worker_tasks)
             cls._worker_tasks = []
+            if cls._shared_fastpath_client is not None:
+                await cls._shared_fastpath_client.aclose()
+                cls._shared_fastpath_client = None
+            if cls._service_lock_guard is not None:
+                cls._service_lock_guard.__exit__(None, None, None)
+                cls._service_lock_guard = None
 
     @classmethod
     async def _durable_retention_loop(cls) -> None:
@@ -386,6 +393,24 @@ class MCPHandler:
                                 "worker": worker_id,
                                 "result": result,
                             }
+                        except CheckpointIntegrityError as exc:
+                            if not store.quarantine_checkpoint(
+                                job_id=job_id, lease_owner=str(job.get("lease_owner", "")), error=str(exc)
+                            ):
+                                logging.getLogger(__name__).warning(
+                                    "durable_job_lease_lost_before_quarantine: %s", job_id
+                                )
+                                continue
+                            logging.getLogger(__name__).error(
+                                "durable_job_checkpoint_quarantined: %s: %s", job_id, exc
+                            )
+                            cls._write_stats["failed"] += 1
+                            cls._user_write_stat(str(job.get("user_id", "")), "failed")
+                            cls._write_status_by_job_id[job_id] = {
+                                "job_id": job_id, "kind": str(job["kind"]),
+                                "status": "quarantined", "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                                "worker": worker_id, "error": str(exc),
+                            }
                         except Exception as exc:
                             status = store.mark_failed(
                                 job_id=job_id,
@@ -490,6 +515,10 @@ class MCPHandler:
                 "message": "Stored exact raw memory entry",
             }
 
+        checkpoint_store = cls._durable_store
+        lease_owner = str(job.get("lease_owner", ""))
+        if checkpoint_store is None or not lease_owner:
+            raise RuntimeError("durable_job_checkpoint_unavailable")
         builder = MemoryBuilder(
             llm_client=llm_client,
             vector_store=vector_store,
@@ -499,6 +528,12 @@ class MCPHandler:
             temperature=settings.llm_temperature,
             max_retries=settings.llm_max_retries,
             entry_id_namespace=f"simplemem:{user_id}:{job_id}",
+            checkpoint_loader=lambda window, input_hash: checkpoint_store.load_checkpoint(
+                job_id=job_id, lease_owner=lease_owner, window_index=window, input_hash=input_hash
+            ),
+            checkpoint_saver=lambda window, input_hash, entries: checkpoint_store.save_checkpoint(
+                job_id=job_id, lease_owner=lease_owner, window_index=window, input_hash=input_hash, entries=entries
+            ),
         )
 
         if kind == "memory_add":
