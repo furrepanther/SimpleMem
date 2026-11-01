@@ -1226,12 +1226,13 @@ def test_handler_is_not_exposed_during_failed_startup_or_after_shutdown(tmp_path
         def new_handler():
             return MCPHandler(user=object(), api_key="fixture", vector_store=object(), client_manager=object(), settings=settings)
         def concurrent_request():
-            try:
-                new_handler()
-            except RuntimeError as exc:
-                attempted.append(str(exc))
-            else:
-                attempted.append("unexpected success")
+            for initialize in (new_handler, lambda: MCPHandler._initialize_durable_runtime(settings)):
+                try:
+                    initialize()
+                except RuntimeError as exc:
+                    attempted.append(str(exc))
+                else:
+                    attempted.append("unexpected success")
         def faulty_create_task(coroutine, **kwargs):
             nonlocal calls
             calls += 1
@@ -1243,7 +1244,7 @@ def test_handler_is_not_exposed_during_failed_startup_or_after_shutdown(tmp_path
         try:
             with pytest.raises(RuntimeError, match="fixture_task_failure"):
                 await MCPHandler.start_background_workers(settings=settings, vector_store=object(), client_manager=object())
-            assert attempted == ["simplemem_durable_runtime_not_ready"]
+            assert attempted == ["simplemem_durable_runtime_not_ready"] * 2
             assert MCPHandler._service_lock_guard is None
             monkeypatch.setattr(asyncio, "create_task", real_create_task)
             await MCPHandler.start_background_workers(settings=settings, vector_store=object(), client_manager=object())

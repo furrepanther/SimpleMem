@@ -214,6 +214,8 @@ class MCPHandler:
         """Own the service lock before migration, recovery, or serving requests."""
         with cls._durable_initialization_lock:
             if cls._service_lock_guard is not None:
+                if not cls._durable_runtime_ready:
+                    raise RuntimeError("simplemem_durable_runtime_not_ready")
                 return False
             created_store = cls._durable_store is None
             store = cls._durable_store or DurableJobStore(settings.durable_queue_db_path)
