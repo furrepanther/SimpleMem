@@ -587,7 +587,7 @@ class MultiTenantVectorStore:
             return self._row_to_entry(matches.iloc[0])
         except Exception as e:
             print(f"Get entry error: {e}")
-            return None
+            raise
 
     async def delete_entry(self, table_name: str, entry_id: str) -> dict[str, Any]:
         """Delete one entry by ID from a user's table."""
