@@ -769,6 +769,7 @@ def test_stale_queued_batch_job_is_not_executed_twice(tmp_path, monkeypatch) -> 
         monkeypatch.setattr(MCPHandler, "_durable_store", store)
         monkeypatch.setattr(MCPHandler, "_shared_settings", settings)
         monkeypatch.setattr(MCPHandler, "_worker_shutdown", asyncio.Event())
+        monkeypatch.setattr(MCPHandler, "_lease_recoveries", 0)
         monkeypatch.setattr(MCPHandler, "_write_status_by_job_id", {})
         monkeypatch.setattr(MCPHandler, "_write_status_order", deque())
         monkeypatch.setattr(MCPHandler, "_write_stats", dict(MCPHandler._write_stats))
