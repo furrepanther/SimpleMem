@@ -145,29 +145,33 @@ class UserStore:
         )
         conn.commit()
 
-    def rotate_api_key(self, user_id: str, encrypted_api_key: str) -> bool:
+    def rotate_api_key(
+        self, user_id: str, encrypted_api_key: str, *, expected_token_version: int
+    ) -> bool:
         conn = self._get_connection()
-        cursor = conn.execute(
-            """
-            UPDATE users
-            SET openrouter_api_key_encrypted = ?,
-                token_version = token_version + 1,
-                last_active = ?
-            WHERE user_id = ?
-            """,
-            (encrypted_api_key, datetime.now(timezone.utc).isoformat(), user_id),
-        )
-        conn.commit()
-        return cursor.rowcount > 0
+        with conn:
+            cursor = conn.execute(
+                """
+                UPDATE users
+                SET openrouter_api_key_encrypted = ?,
+                    token_version = token_version + 1,
+                    last_active = ?
+                WHERE user_id = ? AND token_version = ?
+                """,
+                (encrypted_api_key, datetime.now(timezone.utc).isoformat(),
+                 user_id, expected_token_version),
+            )
+        return cursor.rowcount == 1
 
-    def revoke_tokens(self, user_id: str) -> bool:
+    def revoke_tokens(self, user_id: str, *, expected_token_version: int) -> bool:
         conn = self._get_connection()
-        cursor = conn.execute(
-            "UPDATE users SET token_version = token_version + 1 WHERE user_id = ?",
-            (user_id,),
-        )
-        conn.commit()
-        return cursor.rowcount > 0
+        with conn:
+            cursor = conn.execute(
+                "UPDATE users SET token_version = token_version + 1 "
+                "WHERE user_id = ? AND token_version = ?",
+                (user_id, expected_token_version),
+            )
+        return cursor.rowcount == 1
 
     def delete_user(self, user_id: str) -> bool:
         conn = self._get_connection()

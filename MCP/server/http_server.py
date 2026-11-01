@@ -609,9 +609,13 @@ async def refresh_token(token: str = Header(..., alias="Authorization")):
 async def revoke_tokens(authorization: Optional[str] = Header(None)):
     """Revoke all existing tokens and sessions for the authenticated user."""
     user, _ = await verify_bearer_token(authorization)
-    revoked = await asyncio.to_thread(user_store.revoke_tokens, user.user_id)
+    revoked = await asyncio.to_thread(
+        user_store.revoke_tokens, user.user_id, expected_token_version=user.token_version
+    )
     if not revoked:
-        raise HTTPException(status_code=404, detail="User not found")
+        if not await asyncio.to_thread(user_store.get_user, user.user_id):
+            raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=409, detail="Token version changed; reauthenticate")
     await _invalidate_user_sessions(user.user_id)
     return {"success": True, "user_id": user.user_id}
 
@@ -650,14 +654,19 @@ async def rotate_api_key(
 
     encrypted_api_key = token_manager.encrypt_api_key(rotation.openrouter_api_key)
     rotated = await asyncio.to_thread(
-        user_store.rotate_api_key, user.user_id, encrypted_api_key
+        user_store.rotate_api_key, user.user_id, encrypted_api_key,
+        expected_token_version=user.token_version,
     )
     if not rotated:
-        raise HTTPException(status_code=404, detail="User not found")
+        if not await asyncio.to_thread(user_store.get_user, user.user_id):
+            raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=409, detail="Token version changed; reauthenticate")
+    await _invalidate_user_sessions(user.user_id)
     updated_user = await asyncio.to_thread(user_store.get_user, user.user_id)
     if not updated_user:
         raise HTTPException(status_code=404, detail="User not found")
-    await _invalidate_user_sessions(user.user_id)
+    if updated_user.token_version != user.token_version + 1:
+        raise HTTPException(status_code=409, detail="Token version changed; reauthenticate")
     return {
         "success": True,
         "user_id": updated_user.user_id,
