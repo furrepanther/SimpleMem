@@ -834,3 +834,62 @@ def test_stale_queued_batch_job_is_not_executed_twice(tmp_path, monkeypatch) -> 
             store.close()
 
     asyncio.run(scenario())
+
+
+def test_lease_recovery_process_crash_preserves_fencing(tmp_path) -> None:
+    """A crash between row recoveries preserves each job and fences old owners."""
+    import os
+    import subprocess
+    import sys
+
+    db = tmp_path / "recovery-crash.db"
+    store = DurableJobStore(str(db))
+    job_ids = [
+        store.enqueue_or_get(
+            user_id=user, kind="memory_store", idempotency_key=user,
+            payload={"content": user}, max_inflight_writes=10,
+        )["job_id"]
+        for user in ("fixture-a", "fixture-b")
+    ]
+    assert len(store.claim_batch(worker_id="old-worker", batch_size=2, lease_seconds=5)) == 2
+    conn = store._get_connection()
+    conn.execute("UPDATE durable_jobs SET lease_expires_at_utc = '2000-01-01T00:00:00+00:00'")
+    rows = conn.execute(
+        "SELECT job_id FROM durable_jobs WHERE status = 'processing' AND lease_expires_at_utc < ?",
+        (store._utc_now_iso(),),
+    ).fetchall()
+    first, second = (str(row["job_id"]) for row in rows)
+    conn.execute(
+        "CREATE TRIGGER fixture_crash BEFORE UPDATE ON durable_jobs "
+        "WHEN NEW.status = 'failed_retryable' AND crash_on_job(OLD.job_id) "
+        "BEGIN SELECT 1; END"
+    )
+    child = """
+import os, sys
+from server.database.durable_job_store import DurableJobStore
+store = DurableJobStore(sys.argv[1])
+def crash_on_job(job_id):
+    if job_id == sys.argv[2]:
+        os._exit(73)
+    return 0
+store._get_connection().create_function('crash_on_job', 1, crash_on_job)
+store.recover_expired_leases()
+raise SystemExit(99)
+"""
+    env = dict(os.environ)
+    try:
+        proc = subprocess.run([sys.executable, "-c", child, str(db), second], env=env, capture_output=True, text=True)
+        assert proc.returncode == 73, proc.stderr
+        assert store.get_job(job_id=first)["status"] == "failed_retryable"
+        assert store.get_job(job_id=second)["status"] == "processing"
+        conn.execute("DROP TRIGGER fixture_crash")
+        assert store.recover_expired_leases() == 1
+        claimed = store.claim_batch(worker_id="new-worker", batch_size=2, lease_seconds=5)
+        assert {job["job_id"] for job in claimed} == set(job_ids)
+        for job_id in job_ids:
+            assert not store.mark_done(job_id=job_id, lease_owner="old-worker", result={"stale": True})
+            assert store.mark_done(job_id=job_id, lease_owner="new-worker", result={"fresh": True})
+            assert not store.mark_done(job_id=job_id, lease_owner="new-worker", result={"duplicate": True})
+            assert store.get_job(job_id=job_id)["result"] == {"fresh": True}
+    finally:
+        store.close()
