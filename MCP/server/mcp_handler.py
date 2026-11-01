@@ -76,6 +76,7 @@ class MCPHandler:
     _durable_store: Optional[DurableJobStore] = None
     _service_lock_guard: Optional[Any] = None
     _durable_initialization_lock = threading.Lock()
+    _durable_runtime_ready = False
     _shared_settings: Optional[Any] = None
     _shared_vector_store: Optional[MultiTenantVectorStore] = None
     _shared_client_manager: Optional[ClientManager] = None
@@ -200,16 +201,13 @@ class MCPHandler:
         self._retriever: Optional[Retriever] = None
         self._answer_generator: Optional[AnswerGenerator] = None
 
-        # Ensure class-level shared runtime is initialized once.
-        if MCPHandler._shared_vector_store is None:
-            MCPHandler._shared_vector_store = vector_store
-        if MCPHandler._shared_client_manager is None:
-            MCPHandler._shared_client_manager = client_manager
-        if MCPHandler._shared_settings is None:
-            MCPHandler._shared_settings = settings
-        MCPHandler._initialize_durable_runtime(settings)
-        if isinstance(vector_store, MultiTenantVectorStore):
-            vector_store.set_pending_replay_checker(MCPHandler._durable_store.has_pending_entry)
+        # The HTTP lifespan owns startup and shutdown. Never expose a handler
+        # while startup is incomplete or releasing its service lock.
+        with MCPHandler._durable_initialization_lock:
+            if not MCPHandler._durable_runtime_ready or MCPHandler._service_lock_guard is None:
+                raise RuntimeError("simplemem_durable_runtime_not_ready")
+            if isinstance(vector_store, MultiTenantVectorStore):
+                vector_store.set_pending_replay_checker(MCPHandler._durable_store.has_pending_entry)
 
     @classmethod
     def _initialize_durable_runtime(cls, settings: Any) -> bool:
@@ -293,6 +291,8 @@ class MCPHandler:
                     )
                     new_workers.append(task)
                     cls._worker_tasks.append(task)
+                with cls._durable_initialization_lock:
+                    cls._durable_runtime_ready = True
             except BaseException:
                 # These tasks were created without yielding, so none has begun
                 # processing an accepted job. Leave preexisting workers intact.
@@ -315,6 +315,8 @@ class MCPHandler:
         if cls._runtime_lock is None:
             cls._runtime_lock = asyncio.Lock()
         async with cls._runtime_lock:
+            with cls._durable_initialization_lock:
+                cls._durable_runtime_ready = False
             if cls._worker_shutdown is not None:
                 cls._worker_shutdown.set()
             if cls._retention_task is not None:

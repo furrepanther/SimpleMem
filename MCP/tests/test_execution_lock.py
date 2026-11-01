@@ -1207,3 +1207,53 @@ def test_failed_worker_scale_up_preserves_existing_worker_and_service_lock(tmp_p
             store.close()
             observer.close()
     asyncio.run(scenario())
+
+
+def test_handler_is_not_exposed_during_failed_startup_or_after_shutdown(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from server.database.durable_job_store import DurableJobStore
+    from server.mcp_handler import MCPHandler
+
+    async def scenario():
+        store = DurableJobStore(str(tmp_path / "queue.sqlite"))
+        settings = SimpleNamespace(memory_write_workers=1, memory_write_max_retries=6, memory_write_lease_seconds=90, memory_write_batch_max=1, memory_write_batch_max_wait_ms=10, memory_write_purge_interval_s=300, memory_write_retention_hours=24)
+        for name, value in (("_runtime_lock", None), ("_durable_store", store), ("_service_lock_guard", None), ("_durable_runtime_ready", False), ("_worker_shutdown", None), ("_worker_tasks", []), ("_retention_task", None), ("_lease_recoveries", 0), ("_shared_fastpath_client", None)):
+            monkeypatch.setattr(MCPHandler, name, value)
+        real_create_task = asyncio.create_task
+        attempted = []
+        calls = 0
+        def new_handler():
+            return MCPHandler(user=object(), api_key="fixture", vector_store=object(), client_manager=object(), settings=settings)
+        def concurrent_request():
+            try:
+                new_handler()
+            except RuntimeError as exc:
+                attempted.append(str(exc))
+            else:
+                attempted.append("unexpected success")
+        def faulty_create_task(coroutine, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                asyncio.get_running_loop().call_soon(concurrent_request)
+                raise RuntimeError("fixture_task_failure")
+            return real_create_task(coroutine, **kwargs)
+        monkeypatch.setattr(asyncio, "create_task", faulty_create_task)
+        try:
+            with pytest.raises(RuntimeError, match="fixture_task_failure"):
+                await MCPHandler.start_background_workers(settings=settings, vector_store=object(), client_manager=object())
+            assert attempted == ["simplemem_durable_runtime_not_ready"]
+            assert MCPHandler._service_lock_guard is None
+            monkeypatch.setattr(asyncio, "create_task", real_create_task)
+            await MCPHandler.start_background_workers(settings=settings, vector_store=object(), client_manager=object())
+            assert isinstance(new_handler(), MCPHandler)
+            await MCPHandler.stop_background_workers()
+            with pytest.raises(RuntimeError, match="simplemem_durable_runtime_not_ready"):
+                new_handler()
+        finally:
+            monkeypatch.setattr(asyncio, "create_task", real_create_task)
+            if MCPHandler._service_lock_guard is not None:
+                await MCPHandler.stop_background_workers()
+            store.close()
+    asyncio.run(scenario())
