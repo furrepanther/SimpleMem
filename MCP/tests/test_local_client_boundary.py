@@ -26,11 +26,14 @@ def test_base_endpoint_is_required_before_client_creation(factory, kwargs):
     (OpenRouterClientManager, {}),
 ])
 @pytest.mark.parametrize("name,value", [
-    ("base_url", "https://openrouter.ai/api/v1"),
+    ("base_url", "https://inference.invalid/v1"),
     ("base_url", ""),
-    ("embedding_base_url", "https://example.com/v1"),
+    ("base_url", "http://localhost.inference.invalid/v1"),
+    ("base_url", "http://127.0.0.1.inference.invalid/v1"),
+    ("base_url", "http://localhost@inference.invalid/v1"),
+    ("embedding_base_url", "https://inference.invalid/v1"),
     ("embedding_base_url", ""),
-    ("rerank_base_url", "https://example.com/v1"),
+    ("rerank_base_url", "https://inference.invalid/v1"),
     ("rerank_base_url", ""),
 ])
 def test_nonlocal_or_empty_explicit_endpoint_is_rejected(factory, kwargs, name, value):
