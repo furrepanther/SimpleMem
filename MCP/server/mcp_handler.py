@@ -142,14 +142,25 @@ class MCPHandler:
         ts_dict: dict[str, float],
         key: str,
         future: asyncio.Future,
+        *,
+        preserve_pending: bool = False,
     ) -> None:
         now = time.monotonic()
-        expired = [k for k, t in ts_dict.items() if now - t > cls._INFLIGHT_TTL_S]
+        expired = [
+            k for k, t in ts_dict.items()
+            if now - t > cls._INFLIGHT_TTL_S
+            and (not preserve_pending or k not in inflight_dict or inflight_dict[k].done())
+        ]
         for k in expired:
             inflight_dict.pop(k, None)
             ts_dict.pop(k, None)
         if len(inflight_dict) >= cls._MAX_INFLIGHT:
-            oldest_key = next(iter(inflight_dict))
+            oldest_key = next(
+                (k for k, value in inflight_dict.items() if not preserve_pending or value.done()),
+                None,
+            )
+            if oldest_key is None:
+                raise RuntimeError("memory_query_overloaded: in-flight limit reached")
             inflight_dict.pop(oldest_key, None)
             ts_dict.pop(oldest_key, None)
         inflight_dict[key] = future
@@ -1912,6 +1923,7 @@ class MCPHandler:
             MCPHandler._query_inflight_ts,
             cache_key,
             owner_future,
+            preserve_pending=True,
         )
 
         gate_entered = False

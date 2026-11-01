@@ -2,6 +2,7 @@ import asyncio
 import warnings
 from datetime import datetime
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -32,6 +33,90 @@ def make_handler(generator):
     handler._get_retriever = lambda: SimpleNamespace(retrieve=retrieve)
     handler._get_answer_generator = lambda: generator
     return handler
+
+
+def test_query_inflight_keeps_pending_owner_past_age_threshold():
+    async def exercise():
+        first = asyncio.get_running_loop().create_future()
+        second = asyncio.get_running_loop().create_future()
+        inflight, timestamps = {}, {}
+        with patch("server.mcp_handler.time.monotonic", side_effect=[1000.0, 1301.0]):
+            MCPHandler._add_inflight(inflight, timestamps, "first", first, preserve_pending=True)
+            MCPHandler._add_inflight(inflight, timestamps, "second", second, preserve_pending=True)
+        assert not first.done() and inflight["first"] is first
+
+    asyncio.run(exercise())
+
+
+def test_query_inflight_capacity_rejects_instead_of_evicting_pending_owner():
+    async def exercise():
+        first = asyncio.get_running_loop().create_future()
+        second = asyncio.get_running_loop().create_future()
+        inflight, timestamps = {}, {}
+        with patch.object(MCPHandler, "_MAX_INFLIGHT", 1):
+            MCPHandler._add_inflight(inflight, timestamps, "first", first, preserve_pending=True)
+            with pytest.raises(RuntimeError, match="memory_query_overloaded"):
+                MCPHandler._add_inflight(inflight, timestamps, "second", second, preserve_pending=True)
+        assert inflight == {"first": first} and not first.done()
+
+    asyncio.run(exercise())
+
+
+def test_inflight_default_preserves_retrieve_legacy_expiration():
+    async def exercise():
+        first = asyncio.get_running_loop().create_future()
+        second = asyncio.get_running_loop().create_future()
+        inflight, timestamps = {}, {}
+        with patch("server.mcp_handler.time.monotonic", side_effect=[1000.0, 1301.0]):
+            MCPHandler._add_inflight(inflight, timestamps, "first", first)
+            MCPHandler._add_inflight(inflight, timestamps, "second", second)
+        assert "first" not in inflight and not first.done()
+
+    asyncio.run(exercise())
+
+
+def test_query_inflight_reclaims_completed_entries_at_capacity():
+    async def exercise():
+        finished = asyncio.get_running_loop().create_future()
+        finished.set_result("done")
+        next_request = asyncio.get_running_loop().create_future()
+        inflight, timestamps = {}, {}
+        with patch.object(MCPHandler, "_MAX_INFLIGHT", 1):
+            MCPHandler._add_inflight(inflight, timestamps, "finished", finished, preserve_pending=True)
+            MCPHandler._add_inflight(inflight, timestamps, "next", next_request, preserve_pending=True)
+        assert inflight == {"next": next_request}
+
+    asyncio.run(exercise())
+
+
+def test_query_coalesces_pending_request_after_inflight_age_threshold():
+    async def exercise():
+        release = asyncio.Event()
+        started = asyncio.Event()
+        calls = []
+
+        async def generate_answer(query, contexts):
+            calls.append(query)
+            if len(calls) == 2:
+                started.set()
+            await release.wait()
+            return {"answer": query, "confidence": "high"}
+
+        handler = make_handler(SimpleNamespace(generate_answer=generate_answer))
+        with patch.object(MCPHandler, "_INFLIGHT_TTL_S", -1):
+            first = asyncio.create_task(handler._tool_memory_query({"question": "first"}))
+            await asyncio.sleep(0)
+            other = asyncio.create_task(handler._tool_memory_query({"question": "other"}))
+            await started.wait()
+            waiter = asyncio.create_task(handler._tool_memory_query({"question": "first"}))
+            await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.gather(first, other, waiter)
+        assert calls.count("first") == 1 and len(calls) == 2
+        assert results[0]["answer"] == results[2]["answer"] == "first"
+        assert not MCPHandler._query_inflight
+
+    asyncio.run(exercise())
 
 
 def test_query_does_not_cancel_synthesis_after_former_timeout():
