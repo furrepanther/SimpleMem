@@ -1941,13 +1941,6 @@ class MCPHandler:
             contexts = contexts[:top_k]
 
             answer_result = await generator.generate_answer(query=question, contexts=contexts)
-            answer_text = str(answer_result.get("answer", ""))
-            if (
-                answer_text == "An error occurred while generating the answer."
-                and str(answer_result.get("reasoning", "")).startswith("Error:")
-            ):
-                raise RuntimeError("memory_query answer generation failed")
-
             result = {
                 "question": question,
                 "answer": answer_result.get("answer", ""),

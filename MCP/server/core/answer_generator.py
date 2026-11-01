@@ -86,9 +86,13 @@ class AnswerGenerator:
                 )
 
                 data = self.client.extract_json(response)
-                if data:
+                if (
+                    isinstance(data, dict)
+                    and isinstance(data.get("answer"), str)
+                    and data["answer"].strip()
+                ):
                     return {
-                        "answer": data.get("answer", "Unable to generate answer."),
+                        "answer": data["answer"],
                         "reasoning": data.get("reasoning", ""),
                         "confidence": data.get("confidence", "medium"),
                     }
@@ -96,17 +100,9 @@ class AnswerGenerator:
             except Exception as e:
                 print(f"Answer generation attempt {attempt + 1} failed: {e}")
                 if attempt == max_retries - 1:
-                    return {
-                        "answer": "An error occurred while generating the answer.",
-                        "reasoning": f"Error: {str(e)}",
-                        "confidence": "low",
-                    }
+                    raise
 
-        return {
-            "answer": "Unable to generate answer after multiple attempts.",
-            "reasoning": "JSON parsing failed.",
-            "confidence": "low",
-        }
+        raise RuntimeError("Answer generation failed: invalid JSON answer after three attempts")
 
     def _truncate_text(self, text: str, limit: int) -> str:
         if len(text) <= limit:

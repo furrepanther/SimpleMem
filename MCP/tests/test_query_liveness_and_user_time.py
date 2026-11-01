@@ -253,7 +253,7 @@ def test_query_surfaces_real_answer_generator_upstream_failure():
 
         client = FailingClient()
         handler = make_handler(AnswerGenerator(client))
-        with pytest.raises(RuntimeError, match="answer generation failed"):
+        with pytest.raises(RuntimeError, match="fixture upstream failure"):
             await handler._tool_memory_query({"question": "real generator failure"})
         assert client.calls == 3
         assert not MCPHandler._query_cache and not MCPHandler._query_inflight
