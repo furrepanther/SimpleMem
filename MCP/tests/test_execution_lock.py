@@ -442,7 +442,7 @@ def test_checkpoint_is_first_write_wins_owner_fenced_and_deleted_with_job(tmp_pa
 
     store = DurableJobStore(str(tmp_path / "queue.sqlite"))
     try:
-        job_id = store.enqueue_or_get(user_id="fixture", kind="memory_add", idempotency_key="key", payload={"content": "fixture"}, max_inflight_writes=10)["job_id"]
+        job_id = store.enqueue_or_get(user_id="fixture", kind="memory_add", idempotency_key="key", payload={"content": "fixture", "table_name": "fixture"}, max_inflight_writes=10)["job_id"]
         with store.claim_locked_batch(worker_id="owner", batch_size=1, lease_seconds=5) as jobs:
             assert len(jobs) == 1
             assert store.load_checkpoint(job_id=job_id, lease_owner="owner", window_index=0, input_hash="fixture-hash") is None
@@ -474,7 +474,7 @@ def test_generated_window_replays_after_process_crash_without_duplicate_lance_ro
     db = str(tmp_path / "queue.sqlite")
     lance = str(tmp_path / "lance")
     store = DurableJobStore(db)
-    job_id = store.enqueue_or_get(user_id="fixture", kind="memory_add_batch", idempotency_key="key", payload={"content": "fixture"}, max_inflight_writes=10)["job_id"]
+    job_id = store.enqueue_or_get(user_id="fixture", kind="memory_add_batch", idempotency_key="key", payload={"content": "fixture", "table_name": "fixture"}, max_inflight_writes=10)["job_id"]
     child = """
 import asyncio, os, sys
 from server.core.memory_builder import MemoryBuilder
@@ -493,7 +493,7 @@ async def run():
     vector = MultiTenantVectorStore(db_path=sys.argv[2], embedding_dimension=4)
     with store.claim_locked_batch(worker_id='old-owner', batch_size=1, lease_seconds=5) as jobs:
         job = jobs[0]
-        builder = MemoryBuilder(llm_client=Client(), vector_store=vector, table_name='fixture', window_size=1, entry_id_namespace='simplemem:fixture:'+job['job_id'], checkpoint_loader=lambda index, input_hash: store.load_checkpoint(job_id=job['job_id'], lease_owner='old-owner', window_index=index, input_hash=input_hash), checkpoint_saver=lambda index, input_hash, entries: store.save_checkpoint(job_id=job['job_id'], lease_owner='old-owner', window_index=index, input_hash=input_hash, entries=entries))
+        builder = MemoryBuilder(llm_client=Client(), vector_store=vector, table_name='fixture', window_size=1, entry_id_namespace='simplemem:fixture:'+job['job_id'], checkpoint_loader=lambda index, input_hash: store.load_checkpoint(job_id=job['job_id'], lease_owner='old-owner', window_index=index, input_hash=input_hash), checkpoint_saver=lambda index, input_hash, entries: store.save_checkpoint(job_id=job['job_id'], lease_owner='old-owner', window_index=index, input_hash=input_hash, entries=entries), checkpoint_register=lambda ids: store.record_job_entries(job_id=job['job_id'], lease_owner='old-owner', table_name='fixture', entry_ids=ids))
         await builder.add_dialogues([{'speaker': 'u', 'content': 'first', 'timestamp': '2026-01-01T00:00:00Z'}, {'speaker': 'u', 'content': 'second', 'timestamp': '2026-01-01T00:00:00Z'}])
 asyncio.run(run())
 raise SystemExit(99)
@@ -517,7 +517,7 @@ raise SystemExit(99)
         vector = MultiTenantVectorStore(db_path=lance, embedding_dimension=4)
         with store.claim_locked_batch(worker_id="new-owner", batch_size=1, lease_seconds=5) as jobs:
             assert [job["job_id"] for job in jobs] == [job_id]
-            builder = MemoryBuilder(llm_client=client, vector_store=vector, table_name="fixture", window_size=1, entry_id_namespace="simplemem:fixture:"+job_id, checkpoint_loader=lambda index, input_hash: store.load_checkpoint(job_id=job_id, lease_owner="new-owner", window_index=index, input_hash=input_hash), checkpoint_saver=lambda index, input_hash, entries: store.save_checkpoint(job_id=job_id, lease_owner="new-owner", window_index=index, input_hash=input_hash, entries=entries))
+            builder = MemoryBuilder(llm_client=client, vector_store=vector, table_name="fixture", window_size=1, entry_id_namespace="simplemem:fixture:"+job_id, checkpoint_loader=lambda index, input_hash: store.load_checkpoint(job_id=job_id, lease_owner="new-owner", window_index=index, input_hash=input_hash), checkpoint_saver=lambda index, input_hash, entries: store.save_checkpoint(job_id=job_id, lease_owner="new-owner", window_index=index, input_hash=input_hash, entries=entries), checkpoint_register=lambda ids: store.record_job_entries(job_id=job_id, lease_owner="new-owner", table_name="fixture", entry_ids=ids))
             asyncio.run(builder.add_dialogues([{"speaker": "u", "content": "first", "timestamp": "2026-01-01T00:00:00Z"}, {"speaker": "u", "content": "second", "timestamp": "2026-01-01T00:00:00Z"}]))
             assert client.calls == 1
             rows = vector._get_table("fixture").to_pandas()
@@ -537,7 +537,7 @@ def test_checkpoint_integrity_failure_quarantines_without_retention_loss(tmp_pat
 
     async def scenario():
         store = DurableJobStore(str(tmp_path / "queue.sqlite"))
-        job_id = store.enqueue_or_get(user_id="fixture", kind="memory_add", idempotency_key="key", payload={"content": "fixture"}, max_inflight_writes=10)["job_id"]
+        job_id = store.enqueue_or_get(user_id="fixture", kind="memory_add", idempotency_key="key", payload={"content": "fixture", "table_name": "fixture"}, max_inflight_writes=10)["job_id"]
         with store.claim_locked_batch(worker_id="previous", batch_size=1, lease_seconds=5) as jobs:
             assert jobs
             store.save_checkpoint(job_id=job_id, lease_owner="previous", window_index=0, input_hash="original", entries=[])
@@ -847,18 +847,175 @@ def test_changed_window_input_never_reuses_checkpoint_or_calls_model(tmp_path):
         async def create_embedding(self, texts):
             return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
     store = DurableJobStore(str(tmp_path / "queue.sqlite"))
-    job_id = store.enqueue_or_get(user_id="fixture", kind="memory_add", idempotency_key="key", payload={"content": "fixture"}, max_inflight_writes=10)["job_id"]
+    job_id = store.enqueue_or_get(user_id="fixture", kind="memory_add", idempotency_key="key", payload={"content": "fixture", "table_name": "fixture"}, max_inflight_writes=10)["job_id"]
     vector = MultiTenantVectorStore(db_path=str(tmp_path / "lance"), embedding_dimension=4)
     client = Client()
     try:
         with store.claim_locked_batch(worker_id="worker", batch_size=1, lease_seconds=5) as jobs:
             assert jobs
             def builder():
-                return MemoryBuilder(llm_client=client, vector_store=vector, table_name="fixture", entry_id_namespace="simplemem:fixture:"+job_id, checkpoint_loader=lambda index, input_hash: store.load_checkpoint(job_id=job_id, lease_owner="worker", window_index=index, input_hash=input_hash), checkpoint_saver=lambda index, input_hash, entries: store.save_checkpoint(job_id=job_id, lease_owner="worker", window_index=index, input_hash=input_hash, entries=entries))
+                return MemoryBuilder(llm_client=client, vector_store=vector, table_name="fixture", entry_id_namespace="simplemem:fixture:"+job_id, checkpoint_loader=lambda index, input_hash: store.load_checkpoint(job_id=job_id, lease_owner="worker", window_index=index, input_hash=input_hash), checkpoint_saver=lambda index, input_hash, entries: store.save_checkpoint(job_id=job_id, lease_owner="worker", window_index=index, input_hash=input_hash, entries=entries), checkpoint_register=lambda ids: store.record_job_entries(job_id=job_id, lease_owner="worker", table_name="fixture", entry_ids=ids))
             asyncio.run(builder().add_dialogue("u", "original", timestamp="2026-01-01T00:00:00Z"))
             with pytest.raises(CheckpointIntegrityError, match="checkpoint_input_mismatch"):
                 asyncio.run(builder().add_dialogue("u", "changed", timestamp="2026-01-01T00:00:00Z"))
             assert client.calls == 1
             assert len(vector._get_table("fixture").to_pandas()) == 1
+    finally:
+        store.close()
+
+
+def test_delete_waits_for_exact_replayable_entry_then_succeeds(tmp_path):
+    import asyncio
+    from server.core.memory_builder import MemoryBuilder
+    from server.database.durable_job_store import DurableJobStore
+    from server.database.vector_store import MultiTenantVectorStore
+
+    class Client:
+        calls = 0
+        async def chat_completion(self, **kwargs):
+            self.calls += 1
+            return "fixture fact"
+        def extract_json(self, response): return {"entries": [{"lossless_restatement": response}]}
+        async def create_embedding(self, texts): return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+    async def scenario():
+        store = DurableJobStore(str(tmp_path / "queue.sqlite"))
+        vector = MultiTenantVectorStore(db_path=str(tmp_path / "lance"), embedding_dimension=4)
+        vector.set_pending_replay_checker(store.has_pending_entry)
+        client = Client()
+        job_id = store.enqueue_or_get(user_id="fixture", kind="memory_add", idempotency_key="key", payload={"content": "fixture", "table_name": "fixture"}, max_inflight_writes=10)["job_id"]
+        def builder(owner):
+            return MemoryBuilder(llm_client=client, vector_store=vector, table_name="fixture", entry_id_namespace="simplemem:fixture:"+job_id, checkpoint_loader=lambda index, h: store.load_checkpoint(job_id=job_id, lease_owner=owner, window_index=index, input_hash=h), checkpoint_saver=lambda index, h, entries: store.save_checkpoint(job_id=job_id, lease_owner=owner, window_index=index, input_hash=h, entries=entries), checkpoint_register=lambda ids: store.record_job_entries(job_id=job_id, lease_owner=owner, table_name="fixture", entry_ids=ids))
+        try:
+            with store.claim_locked_batch(worker_id="old", batch_size=1, lease_seconds=5) as jobs:
+                assert jobs
+                await builder("old").add_dialogue("u", "fixture", timestamp="2026-01-01T00:00:00Z")
+                ids = vector._get_table("fixture").to_pandas()["entry_id"].tolist()
+                assert len(ids) == 1
+                result = await vector.delete_entry("fixture", ids[0])
+                assert result["deleted"] is False and result["retryable"] is True
+                assert result["error"] == "durable_write_not_final"
+            store._get_connection().execute("UPDATE durable_jobs SET lease_expires_at_utc = '2000-01-01T00:00:00+00:00' WHERE job_id = ?", (job_id,))
+            assert store.recover_expired_leases() == 1
+            with store.claim_locked_batch(worker_id="new", batch_size=1, lease_seconds=5) as jobs:
+                assert jobs
+                await builder("new").add_dialogue("u", "fixture", timestamp="2026-01-01T00:00:00Z")
+                assert client.calls == 1
+                assert not (await vector.delete_entry("fixture", ids[0]))["deleted"]
+                assert store.mark_done(job_id=job_id, lease_owner="new", result={"ok": True})
+            # Another pending job for this table does not block an unrelated ID.
+            store.enqueue_or_get(user_id="fixture", kind="memory_store", idempotency_key="other", payload={"content": "other", "table_name": "fixture"}, max_inflight_writes=10)
+            result = await vector.delete_entry("fixture", ids[0])
+            assert result["deleted"] is True
+            assert await vector.get_entry("fixture", ids[0]) is None
+        finally:
+            store.close()
+    asyncio.run(scenario())
+
+
+def test_delete_without_replay_guard_fails_closed(tmp_path):
+    import asyncio
+    from server.auth.models import MemoryEntry
+    from server.database.vector_store import MultiTenantVectorStore
+    async def scenario():
+        vector = MultiTenantVectorStore(db_path=str(tmp_path / "lance"), embedding_dimension=4)
+        await vector.add_entries("fixture", [MemoryEntry(entry_id="id", lossless_restatement="fixture")], [[0.1, 0.2, 0.3, 0.4]])
+        result = await vector.delete_entry("fixture", "id")
+        assert result["deleted"] is False and result["error"] == "durable_replay_guard_unavailable"
+        assert await vector.get_entry("fixture", "id") is not None
+    asyncio.run(scenario())
+
+
+def test_raw_worker_registers_replay_guard_before_memory_write(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from server.database.durable_job_store import DurableJobStore
+    from server.database.vector_store import MultiTenantVectorStore
+    from server.mcp_handler import MCPHandler
+
+    class Client:
+        async def create_bounded_semantic_embedding(self, text): return [0.1, 0.2, 0.3, 0.4]
+    class Clients:
+        def get_client(self, key): return Client()
+    class Users:
+        def get_user(self, user_id): return SimpleNamespace(openrouter_api_key_encrypted="fixture")
+    class Tokens:
+        def decrypt_api_key(self, value): return "fixture"
+    async def scenario():
+        store = DurableJobStore(str(tmp_path / "queue.sqlite"))
+        vector = MultiTenantVectorStore(db_path=str(tmp_path / "lance"), embedding_dimension=4)
+        vector.set_pending_replay_checker(store.has_pending_entry)
+        job_id = store.enqueue_or_get(user_id="fixture", kind="memory_store", idempotency_key="key", payload={"user_id": "fixture", "table_name": "fixture", "content": "raw fixture"}, max_inflight_writes=10)["job_id"]
+        for name, value in (("_durable_store", store), ("_shared_settings", object()), ("_shared_vector_store", vector), ("_shared_client_manager", Clients()), ("_shared_user_store", Users()), ("_shared_token_manager", Tokens())):
+            monkeypatch.setattr(MCPHandler, name, value)
+        try:
+            with store.claim_locked_batch(worker_id="worker", batch_size=1, lease_seconds=5) as jobs:
+                assert len(jobs) == 1
+                result = await MCPHandler._execute_durable_job(jobs[0])
+                assert result["added"]
+                ids = vector._get_table("fixture").to_pandas()["entry_id"].tolist()
+                assert len(ids) == 1
+                rejected = await vector.delete_entry("fixture", ids[0])
+                assert rejected["error"] == "durable_write_not_final" and rejected["retryable"]
+                assert store.mark_done(job_id=job_id, lease_owner="worker", result=result)
+            assert (await vector.delete_entry("fixture", ids[0]))["deleted"]
+        finally:
+            store.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["_tool_memory_store", "_tool_memory_add", "_tool_memory_add_batch"])
+def test_quarantine_is_reported_without_looking_like_processing(tmp_path, monkeypatch, method):
+    import asyncio
+    from types import SimpleNamespace
+    from server.auth.models import User
+    from server.database.durable_job_store import DurableJobStore
+    from server.mcp_handler import MCPHandler
+
+    store = DurableJobStore(str(tmp_path / "queue.sqlite"))
+    job_id = store.enqueue_or_get(user_id="fixture", kind="memory_store", idempotency_key="key", payload={"content": "fixture"}, max_inflight_writes=10)["job_id"]
+    store._get_connection().execute("UPDATE durable_jobs SET status='quarantined', last_error='checkpoint mismatch' WHERE job_id = ?", (job_id,))
+    monkeypatch.setattr(MCPHandler, "_durable_store", store)
+    handler = MCPHandler.__new__(MCPHandler)
+    handler.user = User(user_id="fixture")
+    handler.settings = SimpleNamespace(memory_add_async_default=False, memory_sync_wait_timeout_ms=100, memory_write_max_content_chars=8192, memory_write_max_metadata_chars=4096)
+    async def queued(**kwargs):
+        return {"accepted": True, "status": "quarantined", "job_id": job_id, "idempotency_key": "key", "existing": True, "last_error": "checkpoint mismatch"}
+    monkeypatch.setattr(handler, "_enqueue_durable", queued)
+    try:
+        result = asyncio.run(getattr(handler, method)({"content": "fixture", "sync": True}))
+        assert result["status"] == "quarantined"
+        assert result["error"] == "checkpoint mismatch" and result["retryable"] is False
+        assert store.queue_counts(user_id="fixture")["quarantined"] == 1
+    finally:
+        store.close()
+
+
+def test_health_distinguishes_quarantined_jobs_from_unavailable_queue(tmp_path):
+    import ast
+    import asyncio
+    import logging
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from typing import Any
+    from server.database.durable_job_store import DurableJobStore
+
+    source = (Path(__file__).resolve().parents[1] / "server/http_server.py").read_text()
+    tree = ast.parse(source)
+    function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "health_check")
+    function.decorator_list = []
+    store = DurableJobStore(str(tmp_path / "queue.sqlite"))
+    job_id = store.enqueue_or_get(user_id="fixture", kind="memory_store", idempotency_key="key", payload={"content": "fixture"}, max_inflight_writes=10)["job_id"]
+    store._get_connection().execute("UPDATE durable_jobs SET status='quarantined' WHERE job_id = ?", (job_id,))
+    handler = SimpleNamespace(_durable_store=store)
+    scope = {"MCPHandler": handler, "user_store": SimpleNamespace(count_users=lambda: 1), "vector_store": SimpleNamespace(table_names=lambda: []), "datetime": datetime, "timezone": timezone, "logger": logging.getLogger(__name__), "Any": Any}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "health_check_fixture", "exec"), scope)
+    try:
+        health = asyncio.run(scope["health_check"]())
+        assert health["status"] == "healthy" and health["checks"]["queue_db"] is True
+        assert health["queue_state"] == "attention_required" and health["queue"]["quarantined"] == 1
+        handler._durable_store = None
+        health = asyncio.run(scope["health_check"]())
+        assert health["status"] == "degraded" and health["checks"]["queue_db"] is False
+        assert health["queue_state"] == "unavailable"
     finally:
         store.close()

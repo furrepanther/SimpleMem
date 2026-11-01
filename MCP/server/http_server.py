@@ -22,7 +22,7 @@ import re
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Any, Optional
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -662,6 +662,7 @@ async def rotate_api_key(
 @app.get("/api/health")
 async def health_check():
     checks: dict[str, bool] = {"healthy": True, "status": True}
+    queue_health: dict[str, Any] = {}
     try:
         user_store.count_users()
         checks["users_db"] = True
@@ -678,23 +679,33 @@ async def health_check():
         checks["healthy"] = False
     try:
         store = MCPHandler._durable_store
-        if store is not None:
-            store.queue_counts()
-            checks["queue_db"] = True
+        if store is None:
+            raise RuntimeError("durable queue is unavailable")
+        queue_health = store.queue_counts()
+        checks["queue_db"] = True
     except Exception:
         logger.exception("health_check_component_failed component=queue_db")
         checks["queue_db"] = False
         checks["healthy"] = False
+    queue_state = (
+        "unavailable" if not checks.get("queue_db")
+        else "attention_required" if queue_health.get("quarantined", 0)
+        else "ok"
+    )
     if not checks["healthy"]:
         return {
             "status": "degraded",
             "checks": checks,
+            "queue": queue_health,
+            "queue_state": queue_state,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "version": "1.0.0",
         }
     return {
         "status": "healthy",
         "checks": checks,
+        "queue": queue_health,
+        "queue_state": queue_state,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": "1.0.0",
     }

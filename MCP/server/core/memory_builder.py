@@ -41,6 +41,7 @@ class MemoryBuilder:
         entry_id_namespace: str = "",
         checkpoint_loader: Optional[Callable[[int, str], Optional[list[dict[str, Any]]]]] = None,
         checkpoint_saver: Optional[Callable[[int, str, list[dict[str, Any]]], list[dict[str, Any]]]] = None,
+        checkpoint_register: Optional[Callable[[list[str]], None]] = None,
     ):
         self.client = llm_client
         self.vector_store = vector_store
@@ -50,10 +51,12 @@ class MemoryBuilder:
         self.temperature = temperature
         self.max_retries = max(1, int(max_retries))
         self.entry_id_namespace = str(entry_id_namespace or "").strip()
-        if (checkpoint_loader is None) != (checkpoint_saver is None):
-            raise ValueError("checkpoint loader and saver must be provided together")
+        supplied = (checkpoint_loader is not None, checkpoint_saver is not None, checkpoint_register is not None)
+        if any(supplied) and not all(supplied):
+            raise ValueError("checkpoint loader, saver and entry registrar must be provided together")
         self._checkpoint_loader = checkpoint_loader
         self._checkpoint_saver = checkpoint_saver
+        self._checkpoint_register = checkpoint_register
 
         # Context from previous processing for deduplication
         self._previous_context: str = ""
@@ -220,15 +223,19 @@ class MemoryBuilder:
         return decoded
 
     async def _entries_for_window(self, dialogues: List[Dialogue], window_index: int, input_hash: str) -> List[MemoryEntry]:
-        if self._checkpoint_loader is not None:
-            saved = self._checkpoint_loader(window_index, input_hash)
-            if saved is not None:
-                return self._decode_checkpoint(saved)
-        entries = await self._generate_memory_entries(dialogues)
-        if self._checkpoint_saver is None:
-            return entries
-        saved = self._checkpoint_saver(window_index, input_hash, [entry.to_dict() for entry in entries])
-        return self._decode_checkpoint(saved)
+        if self._checkpoint_loader is None:
+            return await self._generate_memory_entries(dialogues)
+        saved = self._checkpoint_loader(window_index, input_hash)
+        if saved is None:
+            entries = await self._generate_memory_entries(dialogues)
+            if self._checkpoint_saver is None:
+                raise RuntimeError("durable checkpoint saver unavailable")
+            saved = self._checkpoint_saver(window_index, input_hash, [entry.to_dict() for entry in entries])
+        entries = self._decode_checkpoint(saved)
+        if self._checkpoint_register is None:
+            raise RuntimeError("durable checkpoint entry registrar unavailable")
+        self._checkpoint_register([entry.entry_id for entry in entries])
+        return entries
 
     async def _generate_memory_entries(
         self,

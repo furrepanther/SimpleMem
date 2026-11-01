@@ -135,6 +135,20 @@ class DurableJobStore:
                 )
                 conn.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS durable_job_entries (
+                        job_id TEXT NOT NULL,
+                        table_name TEXT NOT NULL,
+                        entry_id TEXT NOT NULL,
+                        PRIMARY KEY(job_id, table_name, entry_id),
+                        FOREIGN KEY(job_id) REFERENCES durable_jobs(job_id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_durable_job_entry_lookup ON durable_job_entries(table_name, entry_id)"
+                )
+                conn.execute(
+                    """
                     CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_jobs_idempotency
                     ON durable_jobs(user_id, kind, idempotency_key)
                     """
@@ -343,6 +357,51 @@ class DurableJobStore:
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
+
+    def record_job_entries(
+        self, *, job_id: str, lease_owner: str, table_name: str, entry_ids: list[str]
+    ) -> None:
+        """Record replayable IDs before any corresponding physical write."""
+        if any(not isinstance(entry_id, str) or not entry_id for entry_id in entry_ids):
+            raise CheckpointIntegrityError("invalid durable job entry identity")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT payload_json FROM durable_jobs WHERE job_id = ? AND status = 'processing' AND lease_owner = ?",
+                    (job_id, lease_owner),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("durable_job_lease_lost_before_entry_registration")
+                try:
+                    payload = json.loads(row["payload_json"])
+                except json.JSONDecodeError as exc:
+                    raise CheckpointIntegrityError("invalid durable job payload JSON") from exc
+                if not isinstance(payload, dict) or payload.get("table_name") != table_name:
+                    raise CheckpointIntegrityError("durable_job_table_identity_mismatch")
+                conn.executemany(
+                    "INSERT OR IGNORE INTO durable_job_entries(job_id, table_name, entry_id) VALUES (?, ?, ?)",
+                    [(job_id, table_name, entry_id) for entry_id in entry_ids],
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def has_pending_entry(self, table_name: str, entry_id: str) -> bool:
+        """Return whether an unfinished durable job can replay this exact ID."""
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM durable_job_entries e
+                JOIN durable_jobs j ON j.job_id = e.job_id
+                WHERE e.table_name = ? AND e.entry_id = ?
+                  AND j.status IN ('pending', 'processing', 'failed_retryable', 'quarantined')
+                LIMIT 1
+                """,
+                (table_name, entry_id),
+            ).fetchone()
+            return row is not None
 
     def claim_batch(self, **_kwargs):
         """Reject legacy claims that cannot retain the required execution locks."""

@@ -7,7 +7,7 @@ import os
 import asyncio
 import contextvars
 import threading
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 from datetime import datetime, timezone
 
 import lancedb
@@ -80,6 +80,12 @@ class MultiTenantVectorStore:
         # physical writes for one table must converge through this lock.
         self._table_write_locks: Dict[str, threading.RLock] = {}
         self._table_write_locks_guard = threading.Lock()
+        self._pending_replay_checker: Optional[Callable[[str, str], bool]] = None
+
+    def set_pending_replay_checker(self, checker: Callable[[str, str], bool]) -> None:
+        if not callable(checker):
+            raise ValueError("pending replay checker must be callable")
+        self._pending_replay_checker = checker
 
     def _table_write_lock(self, table_name: str) -> threading.RLock:
         with self._table_write_locks_guard:
@@ -608,30 +614,33 @@ class MultiTenantVectorStore:
             print(f"Get entry error: {e}")
             return None
 
+    def _delete_entry_guarded(self, table_name: str, entry_id: str) -> dict[str, Any]:
+        with self._table_write_lock(table_name):
+            checker = self._pending_replay_checker
+            if checker is None:
+                raise RuntimeError("durable_replay_guard_unavailable")
+            table = self._get_table(table_name)
+            where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
+            existing = table.search().where(where).limit(1).to_pandas()
+            if existing.empty:
+                return {"found": False, "deleted": False, "entry_id": entry_id}
+            if checker(table_name, entry_id):
+                return {"found": True, "deleted": False, "entry_id": entry_id,
+                        "error": "durable_write_not_final", "retryable": True}
+            table.delete(where)
+            remaining = table.search().where(where).limit(1).to_pandas()
+            return {"found": True, "deleted": remaining.empty, "entry_id": entry_id}
+
     async def delete_entry(self, table_name: str, entry_id: str) -> dict[str, Any]:
-        """Delete one entry by ID from a user's table."""
+        """Delete an entry only when no unfinished durable job can replay it."""
         entry_id = str(entry_id or "").strip()
         if not entry_id:
             return {"found": False, "deleted": False, "error": "entry_id_required"}
-        table = await asyncio.to_thread(self._get_table, table_name)
         try:
-            if await asyncio.to_thread(table.count_rows) == 0:
-                return {"found": False, "deleted": False, "entry_id": entry_id}
-            existing = await self.get_entry(table_name, entry_id)
-            if existing is None:
-                return {"found": False, "deleted": False, "entry_id": entry_id}
-            where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
-            await asyncio.to_thread(self._delete_records, table_name, where)
-            deleted = await self.get_entry(table_name, entry_id) is None
-            return {"found": True, "deleted": deleted, "entry_id": entry_id}
+            return await _to_thread_preserving_mutation(self._delete_entry_guarded, table_name, entry_id)
         except Exception as e:
             print(f"Delete entry error: {e}")
-            return {
-                "found": True,
-                "deleted": False,
-                "entry_id": entry_id,
-                "error": str(e),
-            }
+            return {"found": True, "deleted": False, "entry_id": entry_id, "error": str(e)}
 
     async def update_entry(
         self,

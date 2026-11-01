@@ -212,6 +212,8 @@ class MCPHandler:
                     max_retries=max(1, int(settings.memory_write_max_retries))
                 )
             )
+        if isinstance(vector_store, MultiTenantVectorStore):
+            vector_store.set_pending_replay_checker(MCPHandler._durable_store.has_pending_entry)
 
     @classmethod
     async def start_background_workers(
@@ -235,6 +237,8 @@ class MCPHandler:
                 cls._shared_token_manager = token_manager
             if cls._durable_store is None:
                 cls._durable_store = DurableJobStore(settings.durable_queue_db_path)
+            if isinstance(vector_store, MultiTenantVectorStore):
+                vector_store.set_pending_replay_checker(cls._durable_store.has_pending_entry)
             if cls._service_lock_guard is None:
                 guard = cls._durable_store.execution_locks.try_service()
                 if not guard.__enter__():
@@ -489,6 +493,10 @@ class MCPHandler:
             raise RuntimeError("token_manager_not_initialized")
 
         llm_client = client_manager.get_client(api_key)
+        checkpoint_store = cls._durable_store
+        lease_owner = str(job.get("lease_owner", ""))
+        if checkpoint_store is None or not lease_owner:
+            raise RuntimeError("durable_job_checkpoint_unavailable")
 
         if kind == "memory_store":
             entry = cls._build_raw_memory_entry(
@@ -499,6 +507,9 @@ class MCPHandler:
                         f"simplemem:{user_id}:{job_id}:raw",
                     )
                 ),
+            )
+            checkpoint_store.record_job_entries(
+                job_id=job_id, lease_owner=lease_owner, table_name=table_name, entry_ids=[entry.entry_id]
             )
             embedding = await llm_client.create_bounded_semantic_embedding(
                 entry.lossless_restatement
@@ -515,10 +526,6 @@ class MCPHandler:
                 "message": "Stored exact raw memory entry",
             }
 
-        checkpoint_store = cls._durable_store
-        lease_owner = str(job.get("lease_owner", ""))
-        if checkpoint_store is None or not lease_owner:
-            raise RuntimeError("durable_job_checkpoint_unavailable")
         builder = MemoryBuilder(
             llm_client=llm_client,
             vector_store=vector_store,
@@ -533,6 +540,9 @@ class MCPHandler:
             ),
             checkpoint_saver=lambda window, input_hash, entries: checkpoint_store.save_checkpoint(
                 job_id=job_id, lease_owner=lease_owner, window_index=window, input_hash=input_hash, entries=entries
+            ),
+            checkpoint_register=lambda entry_ids: checkpoint_store.record_job_entries(
+                job_id=job_id, lease_owner=lease_owner, table_name=table_name, entry_ids=entry_ids
             ),
         )
 
@@ -1302,7 +1312,7 @@ class MCPHandler:
             if not job:
                 return {"status": "missing"}
             status = str(job.get("status", "unknown"))
-            if status in {"done", "failed_terminal"}:
+            if status in {"done", "failed_terminal", "quarantined"}:
                 return job
             if (asyncio.get_running_loop().time() - start) >= timeout_s:
                 return job
@@ -1804,6 +1814,10 @@ class MCPHandler:
             "existing": bool(queued.get("existing", False)),
         }
 
+        if out["status"] == "quarantined":
+            out["error"] = queued.get("last_error")
+            out["retryable"] = False
+
         force_sync = bool(args.get("sync", False)) or (
             not bool(self.settings.memory_add_async_default)
         )
@@ -1818,9 +1832,11 @@ class MCPHandler:
         if status == "done":
             out["status"] = "done"
             out["result"] = waited.get("result")
-        elif status == "failed_terminal":
-            out["status"] = "failed_terminal"
+        elif status in {"failed_terminal", "quarantined"}:
+            out["status"] = status
             out["error"] = waited.get("last_error")
+            if status == "quarantined":
+                out["retryable"] = False
         else:
             out["status"] = "accepted_processing"
         return out
@@ -1845,6 +1861,10 @@ class MCPHandler:
             "existing": bool(queued.get("existing", False)),
         }
 
+        if out["status"] == "quarantined":
+            out["error"] = queued.get("last_error")
+            out["retryable"] = False
+
         force_sync = bool(args.get("sync", False)) or (
             not bool(self.settings.memory_add_async_default)
         )
@@ -1859,9 +1879,11 @@ class MCPHandler:
         if status == "done":
             out["status"] = "done"
             out["result"] = waited.get("result")
-        elif status == "failed_terminal":
-            out["status"] = "failed_terminal"
+        elif status in {"failed_terminal", "quarantined"}:
+            out["status"] = status
             out["error"] = waited.get("last_error")
+            if status == "quarantined":
+                out["retryable"] = False
         else:
             out["status"] = "accepted_processing"
         return out
@@ -1886,6 +1908,10 @@ class MCPHandler:
             "existing": bool(queued.get("existing", False)),
         }
 
+        if out["status"] == "quarantined":
+            out["error"] = queued.get("last_error")
+            out["retryable"] = False
+
         force_sync = bool(args.get("sync", False)) or (
             not bool(self.settings.memory_add_async_default)
         )
@@ -1900,9 +1926,11 @@ class MCPHandler:
         if status == "done":
             out["status"] = "done"
             out["result"] = waited.get("result")
-        elif status == "failed_terminal":
-            out["status"] = "failed_terminal"
+        elif status in {"failed_terminal", "quarantined"}:
+            out["status"] = status
             out["error"] = waited.get("last_error")
+            if status == "quarantined":
+                out["retryable"] = False
         else:
             out["status"] = "accepted_processing"
         return out
@@ -2248,6 +2276,7 @@ class MCPHandler:
         done = int(durable.get("done", 0))
         failed_retryable = int(durable.get("failed_retryable", 0))
         failed_terminal = int(durable.get("failed_terminal", 0))
+        quarantined = int(durable.get("quarantined", 0))
         oldest_pending_age_s = durable.get("oldest_pending_age_s")
         user_stats = MCPHandler._write_stats_by_user.get(self.user.user_id, {})
         retry_rate_window = user_stats.get("retryable_failures", 0) / max(
@@ -2271,6 +2300,7 @@ class MCPHandler:
                 "done": done,
                 "failed_retryable": failed_retryable,
                 "failed_terminal": failed_terminal,
+                "quarantined": quarantined,
                 "oldest_pending_age_s": oldest_pending_age_s,
                 "retry_rate_window": retry_rate_window,
                 "queue_admission_rejects": user_stats.get("rejected_admission", 0),
