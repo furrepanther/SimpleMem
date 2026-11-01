@@ -1914,8 +1914,10 @@ class MCPHandler:
             owner_future,
         )
 
-        await self._enter_read_gate()
+        gate_entered = False
         try:
+            await self._enter_read_gate()
+            gate_entered = True
             generator = self._get_answer_generator()
             retriever = self._get_retriever()
             contexts = await retriever.retrieve(
@@ -1966,7 +1968,8 @@ class MCPHandler:
                     cache_key,
                     owner_future,
                 )
-            await self._exit_read_gate()
+            if gate_entered:
+                await self._exit_read_gate()
 
     async def _tool_memory_retrieve(self, args: dict) -> dict:
         query = str(args.get("query", "")).strip()

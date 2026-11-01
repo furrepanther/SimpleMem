@@ -106,6 +106,56 @@ def test_query_propagates_generator_failure_without_cache_or_unhandled_future():
     asyncio.run(exercise())
 
 
+def test_query_read_admission_failure_cleans_inflight_and_can_retry():
+    async def exercise():
+        async def generate_answer(**kwargs):
+            return {"answer": "Recovered.", "confidence": "high"}
+
+        handler = make_handler(SimpleNamespace(generate_answer=generate_answer))
+        original_active = MCPHandler._active_read_ops
+        MCPHandler._active_read_ops = handler.settings.memory_queue_max_inflight_reads
+        try:
+            with pytest.raises(RuntimeError, match="memory_query_overloaded"):
+                await handler._tool_memory_query({"question": "admission fixture"})
+            assert not MCPHandler._query_inflight
+            MCPHandler._active_read_ops = 0
+            result = await handler._tool_memory_query({"question": "admission fixture"})
+            assert result["answer"] == "Recovered."
+        finally:
+            MCPHandler._active_read_ops = original_active
+            MCPHandler._invalidate_memory_caches()
+
+    asyncio.run(exercise())
+
+
+def test_query_cancelled_during_admission_releases_waiter_without_exiting_gate():
+    async def exercise():
+        handler = make_handler(None)
+        entered = asyncio.Event()
+        exits = []
+
+        async def enter():
+            entered.set()
+            await asyncio.Event().wait()
+
+        async def exit_gate():
+            exits.append(True)
+
+        handler._enter_read_gate = enter
+        handler._exit_read_gate = exit_gate
+        owner = asyncio.create_task(handler._tool_memory_query({"question": "admission cancellation"}))
+        await entered.wait()
+        waiter = asyncio.create_task(handler._tool_memory_query({"question": "admission cancellation"}))
+        await asyncio.sleep(0)
+        owner.cancel()
+        outcomes = await asyncio.gather(owner, waiter, return_exceptions=True)
+        assert all(isinstance(item, asyncio.CancelledError) for item in outcomes)
+        assert not MCPHandler._query_inflight
+        assert not exits
+
+    asyncio.run(exercise())
+
+
 def test_query_surfaces_real_answer_generator_upstream_failure():
     async def exercise():
         class FailingClient:
