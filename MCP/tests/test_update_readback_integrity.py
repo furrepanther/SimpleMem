@@ -43,3 +43,22 @@ def test_successful_content_metadata_and_vector_update_is_verified(tmp_path):
         updated = await store.get_entry("mem_fixture", "fixture-id")
         assert updated.lossless_restatement == "changed" and updated.keywords == ["verified"]
     asyncio.run(exercise())
+
+
+def test_update_filters_quoted_id_without_materializing_entire_table(tmp_path):
+    store = MultiTenantVectorStore(str(tmp_path / "lance"), embedding_dimension=2)
+    item = entry()
+    item.entry_id = "fixture\'quoted"
+    async def exercise():
+        await store.add_entries("mem_fixture", [item], [[1.0, 0.0]])
+        actual_table = store._get_table("mem_fixture")
+        class NoFullTableRead:
+            def __getattr__(self, name):
+                return getattr(actual_table, name)
+            def to_pandas(self):
+                raise AssertionError("update must not materialize the whole table")
+        store._get_table = lambda _: NoFullTableRead()
+        result = await store.update_entry("mem_fixture", item.entry_id, {"lossless_restatement": "changed"})
+        assert result["updated"] is True
+        assert (await store.get_entry("mem_fixture", item.entry_id)).lossless_restatement == "changed"
+    asyncio.run(exercise())

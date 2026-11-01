@@ -643,8 +643,10 @@ class MultiTenantVectorStore:
         try:
             if await asyncio.to_thread(table.count_rows) == 0:
                 return {"found": False, "updated": False, "entry_id": entry_id}
-            df = await asyncio.to_thread(table.to_pandas)
-            matches = df[df["entry_id"] == entry_id]
+            where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
+            matches = await asyncio.to_thread(
+                lambda: table.search().where(where).limit(1).to_pandas()
+            )
             if matches.empty:
                 return {"found": False, "updated": False, "entry_id": entry_id}
 
@@ -656,8 +658,6 @@ class MultiTenantVectorStore:
                 updates=updates,
                 embedding=embedding,
             )
-            where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
-
             update_values = {k: record[k] for k in allowed if k in updates}
             if embedding is not None:
                 update_values["vector"] = record["vector"]
