@@ -5,6 +5,7 @@ Uses LanceDB for vector storage with per-user table isolation
 
 import os
 import asyncio
+import contextvars
 import threading
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
@@ -13,6 +14,24 @@ import lancedb
 import pyarrow as pa
 
 from ..auth.models import MemoryEntry
+
+
+async def _to_thread_preserving_mutation(function, *args):
+    """Do not release a caller's job lock while a mutation thread still runs."""
+    context = contextvars.copy_context()
+    future = asyncio.get_running_loop().run_in_executor(None, context.run, function, *args)
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(future)
+            break
+        except asyncio.CancelledError:
+            if future.cancelled():
+                raise RuntimeError("mutation completion could not be observed")
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 # LanceDB schema for memory entries
@@ -266,7 +285,7 @@ class MultiTenantVectorStore:
         if not entries:
             return 0
 
-        table = await asyncio.to_thread(self._get_table, table_name)
+        table = await _to_thread_preserving_mutation(self._get_table, table_name)
         table_dim = self._get_table_dimension(table_name, table)
         created_at = datetime.now(timezone.utc).isoformat()
 
@@ -290,7 +309,7 @@ class MultiTenantVectorStore:
 
         # A durable worker may finish embedding concurrently with another
         # worker.  Serialize the manifest-changing append, not the GPU work.
-        await asyncio.to_thread(self._append_records, table_name, records)
+        await _to_thread_preserving_mutation(self._append_records, table_name, records)
         return len(records)
 
     async def semantic_search(

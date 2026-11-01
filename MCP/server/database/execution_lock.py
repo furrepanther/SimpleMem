@@ -101,6 +101,12 @@ class JobExecutionLocks:
                     )
                 elif int(row[0]) != info.st_ino or str(row[1]) != token:
                     raise RuntimeError("durable execution lock file was replaced")
+                # Persist the directory entry before the database binds to it.
+                directory_fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
                 connection.execute("COMMIT")
             except BaseException:
                 connection.execute("ROLLBACK")

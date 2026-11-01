@@ -12,11 +12,27 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .execution_lock import JobExecutionLocks
+
+
+_CLAIM_CANDIDATES_SQL = """
+SELECT job_id, user_id, kind, idempotency_key, payload_json, status, attempt_count,
+       available_at_utc, created_at_utc, updated_at_utc
+FROM (
+    SELECT job_id, user_id, kind, idempotency_key, payload_json, status,
+           attempt_count, available_at_utc, created_at_utc, updated_at_utc,
+           ROW_NUMBER() OVER (
+               PARTITION BY user_id ORDER BY created_at_utc ASC, job_id ASC
+           ) AS user_rank
+    FROM durable_jobs
+    WHERE status IN ('pending', 'failed_retryable') AND available_at_utc <= ?
+)
+WHERE user_rank <= ? ORDER BY created_at_utc ASC, job_id ASC LIMIT ?
+"""
 
 
 class DurableJobStore:
@@ -263,25 +279,7 @@ class DurableJobStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 rows = conn.execute(
-                    """
-                    SELECT job_id, user_id, kind, idempotency_key, payload_json, status, attempt_count,
-                           available_at_utc, created_at_utc, updated_at_utc
-                    FROM (
-                        SELECT job_id, user_id, kind, idempotency_key, payload_json, status,
-                               attempt_count, available_at_utc, created_at_utc, updated_at_utc,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY user_id
-                                   ORDER BY created_at_utc ASC, job_id ASC
-                               ) AS user_rank
-                        FROM durable_jobs
-                        WHERE status IN ('pending', 'failed_retryable')
-                          AND available_at_utc <= ?
-                    )
-                    WHERE user_rank <= ?
-                    ORDER BY created_at_utc ASC, job_id ASC
-                    LIMIT ?
-                    """,
-                    (now_iso, max(1, int(max_jobs_per_user)), take),
+                    _CLAIM_CANDIDATES_SQL, (now_iso, max(1, int(max_jobs_per_user)), take)
                 ).fetchall()
                 if not rows:
                     conn.execute("COMMIT")
@@ -326,6 +324,79 @@ class DurableJobStore:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+
+    @contextmanager
+    def claim_locked_batch(
+        self,
+        *,
+        worker_id: str,
+        batch_size: int,
+        lease_seconds: int,
+        max_jobs_per_user: int = 4,
+    ):
+        """Lock candidates before publishing claims; hold locks until the caller exits."""
+        now = self._utc_now()
+        now_iso = now.isoformat()
+        take = max(1, int(batch_size))
+        with self._connection() as conn:
+            candidates = conn.execute(
+                _CLAIM_CANDIDATES_SQL, (now_iso, max(1, int(max_jobs_per_user)), take)
+            ).fetchall()
+            with ExitStack() as held_locks:
+                locked = []
+                for row in candidates:
+                    if held_locks.enter_context(self.execution_locks.try_job(str(row["job_id"]))):
+                        locked.append(row)
+                if not locked:
+                    yield []
+                    return
+                # No blocking job-lock acquisition occurs inside this transaction.
+                now = self._utc_now()
+                now_iso = now.isoformat()
+                lease_expires_iso = (now + timedelta(seconds=max(5, int(lease_seconds)))).isoformat()
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    out = []
+                    for row in locked:
+                        job_id = str(row["job_id"])
+                        cur = conn.execute(
+                            """
+                            UPDATE durable_jobs
+                            SET status = 'processing', lease_owner = ?,
+                                lease_expires_at_utc = ?, updated_at_utc = ?
+                            WHERE job_id = ? AND status = ? AND available_at_utc = ?
+                              AND updated_at_utc = ? AND attempt_count = ?
+                              AND available_at_utc <= ?
+                            """,
+                            (worker_id, lease_expires_iso, now_iso, job_id,
+                             str(row["status"]), str(row["available_at_utc"]),
+                             str(row["updated_at_utc"]), int(row["attempt_count"]), now_iso),
+                        )
+                        if cur.rowcount != 1:
+                            continue
+                        payload_raw = str(row["payload_json"])
+                        try:
+                            payload = json.loads(payload_raw)
+                        except json.JSONDecodeError:
+                            payload = {"_corrupt_payload": True, "_raw": payload_raw}
+                        out.append({
+                            "job_id": job_id,
+                            "user_id": str(row["user_id"]),
+                            "kind": str(row["kind"]),
+                            "idempotency_key": str(row["idempotency_key"]),
+                            "payload": payload,
+                            "status": str(row["status"]),
+                            "attempt_count": int(row["attempt_count"]),
+                            "lease_owner": worker_id,
+                            "available_at_utc": str(row["available_at_utc"]),
+                            "created_at_utc": str(row["created_at_utc"]),
+                            "updated_at_utc": str(row["updated_at_utc"]),
+                        })
+                    conn.execute("COMMIT")
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+                yield out
 
     def mark_done(
         self, *, job_id: str, lease_owner: str, result: dict[str, Any]

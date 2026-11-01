@@ -780,7 +780,7 @@ def test_stale_queued_batch_job_is_not_executed_twice(tmp_path, monkeypatch) -> 
         monkeypatch.setattr(MCPHandler, "_write_stats_by_user", {})
         monkeypatch.setattr(MCPHandler, "_invalidate_memory_caches", classmethod(lambda cls: None))
         first_started, release_first = asyncio.Event(), asyncio.Event()
-        second_started, duplicate, skipped = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        second_started, duplicate = asyncio.Event(), asyncio.Event()
         seen = []
         stale_id = None
 
@@ -793,22 +793,13 @@ def test_stale_queued_batch_job_is_not_executed_twice(tmp_path, monkeypatch) -> 
                 (second_started if seen.count(stale_id) == 1 else duplicate).set()
             return {"fixture": True}
 
-        original_renew = store.renew_lease
-        def observed_renew(**kwargs):
-            renewed = original_renew(**kwargs)
-            if kwargs["job_id"] == stale_id and not renewed:
-                skipped.set()
-            return renewed
-
         monkeypatch.setattr(MCPHandler, "_execute_durable_job", classmethod(execute_fixture))
-        monkeypatch.setattr(store, "renew_lease", observed_renew)
         async def until(predicate):
             while not predicate():
                 await asyncio.sleep(0.01)
 
         worker_one = asyncio.create_task(MCPHandler._durable_worker_loop(1))
         worker_two = None
-        waiters = []
         try:
             await asyncio.wait_for(first_started.wait(), 5)
             stale_id = next(job_id for job_id in ids if job_id != seen[0])
@@ -818,24 +809,22 @@ def test_stale_queued_batch_job_is_not_executed_twice(tmp_path, monkeypatch) -> 
                     "UPDATE durable_jobs SET lease_expires_at_utc = ? WHERE job_id = ?",
                     ("2000-01-01T00:00:00+00:00", stale_id),
                 )
-            assert store.recover_expired_leases() == 1
+            assert store.recover_expired_leases() == 0
             worker_two = asyncio.create_task(MCPHandler._durable_worker_loop(2))
+            await asyncio.sleep(0.05)
+            assert not second_started.is_set()
+            assert store.get_job(job_id=stale_id)["attempt_count"] == 0
+            release_first.set()
             await asyncio.wait_for(second_started.wait(), 5)
             await asyncio.wait_for(until(lambda: store.get_job(job_id=stale_id)["status"] == "done"), 5)
-            release_first.set()
-            waiters = [asyncio.create_task(skipped.wait()), asyncio.create_task(duplicate.wait())]
-            done, _ = await asyncio.wait(waiters, timeout=5, return_when=asyncio.FIRST_COMPLETED)
-            assert done, "neither stale-lease rejection nor duplicate execution observed"
-            assert skipped.is_set() and not duplicate.is_set()
-            assert seen.count(stale_id) == 1
-            assert store.get_job(job_id=stale_id)["status"] == "done"
+            assert not duplicate.is_set() and seen.count(stale_id) == 1
         finally:
             MCPHandler._worker_shutdown.set()
             release_first.set()
-            for task in [worker_one, worker_two, *waiters]:
+            for task in [worker_one, worker_two]:
                 if task is not None:
                     task.cancel()
-            await asyncio.gather(*(task for task in [worker_one, worker_two, *waiters] if task is not None), return_exceptions=True)
+            await asyncio.gather(*(task for task in [worker_one, worker_two] if task is not None), return_exceptions=True)
             store.close()
 
     asyncio.run(scenario())
@@ -896,5 +885,24 @@ raise SystemExit(99)
             assert store.mark_done(job_id=job_id, lease_owner="new-worker", result={"fresh": True})
             assert not store.mark_done(job_id=job_id, lease_owner="new-worker", result={"duplicate": True})
             assert store.get_job(job_id=job_id)["result"] == {"fresh": True}
+    finally:
+        store.close()
+
+
+def test_pre_execution_fence_rejects_a_reassigned_job(tmp_path, monkeypatch) -> None:
+    store = DurableJobStore(str(tmp_path / "pre-execution-fence.db"))
+    try:
+        job_id = store.enqueue_or_get(user_id="fixture", kind="memory_store", idempotency_key="key", payload={"content": "fixture"}, max_inflight_writes=10)["job_id"]
+        stale = store.claim_batch(worker_id="old", batch_size=1, lease_seconds=5)[0]
+        store._get_connection().execute("UPDATE durable_jobs SET lease_expires_at_utc = '2000-01-01T00:00:00+00:00' WHERE job_id = ?", (job_id,))
+        assert store.recover_expired_leases() == 1
+        assert store.claim_batch(worker_id="new", batch_size=1, lease_seconds=5)
+        called = []
+        async def execute_fixture(cls, job):
+            called.append(job)
+        monkeypatch.setattr(MCPHandler, "_execute_durable_job", classmethod(execute_fixture))
+        with pytest.raises(RuntimeError, match="lease_lost_before_execution"):
+            asyncio.run(MCPHandler._execute_durable_job_with_lease(store=store, job=stale, lease_seconds=5))
+        assert called == []
     finally:
         store.close()

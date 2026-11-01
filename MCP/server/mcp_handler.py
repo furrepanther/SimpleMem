@@ -327,96 +327,98 @@ class MCPHandler:
                         max_retries=max(1, int(settings.memory_write_max_retries))
                     )
                     last_lease_recovery = now_monotonic
-                jobs = store.claim_batch(
+                # Hold every job lock from before claim through completion and
+                # any cancellation cleanup; recovery skips live holders.
+                with store.claim_locked_batch(
                     worker_id=worker_id,
                     batch_size=max(1, int(settings.memory_write_batch_max)),
                     lease_seconds=lease_seconds,
-                )
-                if not jobs:
-                    await asyncio.sleep(
-                        max(
-                            0.005, int(settings.memory_write_batch_max_wait_ms) / 1000.0
+                ) as jobs:
+                    if not jobs:
+                        await asyncio.sleep(
+                            max(
+                                0.005, int(settings.memory_write_batch_max_wait_ms) / 1000.0
+                            )
                         )
-                    )
-                    continue
+                        continue
 
-                for job in jobs:
-                    job_id = str(job["job_id"])
-                    cls._write_status_by_job_id[job_id] = {
-                        "job_id": job_id,
-                        "kind": str(job["kind"]),
-                        "status": "processing",
-                        "started_at_utc": datetime.now(timezone.utc).isoformat(),
-                        "worker": worker_id,
-                    }
-                    cls._write_status_order.append(job_id)
-                    cls._trim_write_status(
-                        getattr(settings, "memory_write_job_status_limit", 2000)
-                    )
-                    try:
-                        result = await cls._execute_durable_job_with_lease(
-                            store=store,
-                            job=job,
-                            lease_seconds=lease_seconds,
-                        )
-                        if not store.mark_done(
-                            job_id=job_id,
-                            lease_owner=str(job.get("lease_owner", "")),
-                            result=result,
-                        ):
-                            logging.getLogger(__name__).warning(
-                                "durable_job_lease_lost_before_done: %s", job_id
-                            )
-                            continue
-                        # A completed durable write changes the local Lance
-                        # corpus.  Clear short-lived retrieval caches before
-                        # clients can observe a stale miss or old ranking.
-                        cls._invalidate_memory_caches()
-                        cls._write_stats["completed"] += 1
-                        cls._user_write_stat(
-                            str(job.get("user_id", "")), "completed"
-                        )
+                    for job in jobs:
+                        job_id = str(job["job_id"])
                         cls._write_status_by_job_id[job_id] = {
                             "job_id": job_id,
                             "kind": str(job["kind"]),
-                            "status": "done",
-                            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                            "status": "processing",
+                            "started_at_utc": datetime.now(timezone.utc).isoformat(),
                             "worker": worker_id,
-                            "result": result,
                         }
-                    except Exception as exc:
-                        status = store.mark_failed(
-                            job_id=job_id,
-                            lease_owner=str(job.get("lease_owner", "")),
-                            error=str(exc),
-                            retryable=True,
-                            max_retries=max(1, int(settings.memory_write_max_retries)),
-                            backoff_base_ms=max(
-                                50, int(settings.memory_write_retry_backoff_base_ms)
-                            ),
+                        cls._write_status_order.append(job_id)
+                        cls._trim_write_status(
+                            getattr(settings, "memory_write_job_status_limit", 2000)
                         )
-                        if status.get("status") == "lease_lost":
-                            logging.getLogger(__name__).warning(
-                                "durable_job_lease_lost_before_failure: %s", job_id
+                        try:
+                            result = await cls._execute_durable_job_with_lease(
+                                store=store,
+                                job=job,
+                                lease_seconds=lease_seconds,
                             )
-                            continue
-                        if status.get("status") == "failed_retryable":
-                            cls._write_stats["retryable_failures"] += 1
+                            if not store.mark_done(
+                                job_id=job_id,
+                                lease_owner=str(job.get("lease_owner", "")),
+                                result=result,
+                            ):
+                                logging.getLogger(__name__).warning(
+                                    "durable_job_lease_lost_before_done: %s", job_id
+                                )
+                                continue
+                            # A completed durable write changes the local Lance
+                            # corpus.  Clear short-lived retrieval caches before
+                            # clients can observe a stale miss or old ranking.
+                            cls._invalidate_memory_caches()
+                            cls._write_stats["completed"] += 1
                             cls._user_write_stat(
-                                str(job.get("user_id", "")), "retryable_failures"
+                                str(job.get("user_id", "")), "completed"
                             )
-                        else:
-                            cls._write_stats["failed"] += 1
-                            cls._user_write_stat(str(job.get("user_id", "")), "failed")
-                        cls._write_status_by_job_id[job_id] = {
-                            "job_id": job_id,
-                            "kind": str(job["kind"]),
-                            "status": status.get("status", "failed_terminal"),
-                            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
-                            "worker": worker_id,
-                            "error": str(exc),
-                            "attempt_count": status.get("attempt_count"),
-                        }
+                            cls._write_status_by_job_id[job_id] = {
+                                "job_id": job_id,
+                                "kind": str(job["kind"]),
+                                "status": "done",
+                                "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                                "worker": worker_id,
+                                "result": result,
+                            }
+                        except Exception as exc:
+                            status = store.mark_failed(
+                                job_id=job_id,
+                                lease_owner=str(job.get("lease_owner", "")),
+                                error=str(exc),
+                                retryable=True,
+                                max_retries=max(1, int(settings.memory_write_max_retries)),
+                                backoff_base_ms=max(
+                                    50, int(settings.memory_write_retry_backoff_base_ms)
+                                ),
+                            )
+                            if status.get("status") == "lease_lost":
+                                logging.getLogger(__name__).warning(
+                                    "durable_job_lease_lost_before_failure: %s", job_id
+                                )
+                                continue
+                            if status.get("status") == "failed_retryable":
+                                cls._write_stats["retryable_failures"] += 1
+                                cls._user_write_stat(
+                                    str(job.get("user_id", "")), "retryable_failures"
+                                )
+                            else:
+                                cls._write_stats["failed"] += 1
+                                cls._user_write_stat(str(job.get("user_id", "")), "failed")
+                            cls._write_status_by_job_id[job_id] = {
+                                "job_id": job_id,
+                                "kind": str(job["kind"]),
+                                "status": status.get("status", "failed_terminal"),
+                                "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                                "worker": worker_id,
+                                "error": str(exc),
+                                "attempt_count": status.get("attempt_count"),
+                            }
             except asyncio.CancelledError:
                 return
             except Exception as _worker_err:
