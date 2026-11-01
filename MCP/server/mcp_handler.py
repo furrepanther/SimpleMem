@@ -525,6 +525,12 @@ class MCPHandler:
         """Renew a job lease while a remote/model-backed write is running."""
         job_id = str(job["job_id"])
         lease_owner = str(job.get("lease_owner", ""))
+        # Batch members can lose their lease while earlier jobs are executing.
+        # Fence the side effect before starting it, not only at completion.
+        if not store.renew_lease(
+            job_id=job_id, lease_owner=lease_owner, lease_seconds=lease_seconds
+        ):
+            raise RuntimeError("durable_job_lease_lost_before_execution")
         stop = asyncio.Event()
         lease_lost = asyncio.Event()
 
