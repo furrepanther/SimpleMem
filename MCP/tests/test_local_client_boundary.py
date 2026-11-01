@@ -1,7 +1,12 @@
 from unittest.mock import patch
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
+from config.settings import _is_local_endpoint
 from server.integrations.openrouter import OpenRouterClient, OpenRouterClientManager
 
 
@@ -48,3 +53,29 @@ def test_explicit_local_endpoints_and_fallback_are_preserved():
     assert (fallback.base_url, fallback.embedding_base_url, fallback.rerank_base_url) == (base, embed, embed)
     all_fallback = OpenRouterClientManager(base).get_client("fixture")
     assert (all_fallback.base_url, all_fallback.embedding_base_url, all_fallback.rerank_base_url) == (base, base, base)
+
+
+def test_client_import_does_not_import_settings():
+    mcp_root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ, PYTHONPATH=str(mcp_root), PYTHONDONTWRITEBYTECODE="1")
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys; import server.integrations.openrouter; assert 'config.settings' not in sys.modules"],
+        cwd=mcp_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("endpoint", [
+    "http://127.0.0.1:11437/v1", "https://localhost/v1", "http://[::1]:8000/v1",
+    "http://example.com/v1", "ftp://localhost/v1", "", "http://localhost@example.com/v1",
+])
+def test_client_loopback_rule_matches_settings(endpoint):
+    if _is_local_endpoint(endpoint):
+        assert OpenRouterClientManager(endpoint).base_url == endpoint
+    else:
+        with pytest.raises(ValueError):
+            OpenRouterClientManager(endpoint)
