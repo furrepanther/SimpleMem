@@ -668,13 +668,17 @@ def test_idempotency_limit_preserves_valid_keys_and_is_advertised() -> None:
     handler.user = User(user_id="fixture")
     assert handler._compute_idempotency_key(kind="memory_store", args={"idempotency_key": "k" * 256}) == "k" * 256
     assert handler._compute_idempotency_key(kind="memory_store", args={"idempotency_key": "  key  "}) == "key"
+    assert handler._compute_idempotency_key(kind="memory_store", args={"idempotency_key": " " + "k" * 256 + " "}) == "k" * 256
+    assert handler._compute_idempotency_key(kind="memory_store", args={"idempotency_key": " " * 257}) == handler._compute_idempotency_key(kind="memory_store", args={})
     with pytest.raises(ValueError, match="idempotency_key exceeds 256"):
-        handler._compute_idempotency_key(kind="memory_store", args={"idempotency_key": " " * 257})
+        handler._compute_idempotency_key(kind="memory_store", args={"idempotency_key": " " + "k" * 257 + " "})
     tools = asyncio.run(handler._handle_tools_list({}))["tools"]
     write_tools = {tool["name"]: tool for tool in tools if tool["name"] in {"memory_store", "memory_add", "memory_add_batch"}}
     assert set(write_tools) == {"memory_store", "memory_add", "memory_add_batch"}
     for tool in write_tools.values():
-        assert tool["inputSchema"]["properties"]["idempotency_key"]["maxLength"] == 256
+        schema = tool["inputSchema"]["properties"]["idempotency_key"]
+        assert "maxLength" not in schema
+        assert "256 characters after trimming" in schema["description"]
 
 
 def test_batch_payload_limit_rejects_oversize_before_durable_enqueue(monkeypatch) -> None:

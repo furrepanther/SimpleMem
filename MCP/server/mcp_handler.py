@@ -1081,10 +1081,9 @@ class MCPHandler:
         )
 
     def _compute_idempotency_key(self, *, kind: str, args: dict[str, Any]) -> str:
-        provided = str(args.get("idempotency_key", ""))
+        provided = str(args.get("idempotency_key", "")).strip()
         if len(provided) > 256:
             raise ValueError("idempotency_key exceeds 256 characters")
-        provided = provided.strip()
         if provided:
             return provided
         if kind == "memory_store":
@@ -1454,8 +1453,7 @@ class MCPHandler:
                             },
                             "idempotency_key": {
                                 "type": "string",
-                                "maxLength": 256,
-                                "description": "Optional idempotency key",
+                                "description": "Optional idempotency key; at most 256 characters after trimming whitespace",
                             },
                         },
                         "required": ["content"],
@@ -1501,8 +1499,7 @@ class MCPHandler:
                             },
                             "idempotency_key": {
                                 "type": "string",
-                                "maxLength": 256,
-                                "description": "Optional idempotency key",
+                                "description": "Optional idempotency key; at most 256 characters after trimming whitespace",
                             },
                         },
                         "required": [],
@@ -1532,8 +1529,7 @@ class MCPHandler:
                             },
                             "idempotency_key": {
                                 "type": "string",
-                                "maxLength": 256,
-                                "description": "Optional idempotency key",
+                                "description": "Optional idempotency key; at most 256 characters after trimming whitespace",
                             },
                         },
                         "required": ["dialogues"],
