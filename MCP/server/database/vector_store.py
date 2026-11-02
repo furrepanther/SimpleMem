@@ -5,6 +5,7 @@ Uses LanceDB for vector storage with per-user table isolation
 
 import os
 import asyncio
+import json
 import threading
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
@@ -30,6 +31,8 @@ def get_memory_schema(embedding_dimension: int = 2560) -> pa.Schema:
             pa.field("topic", pa.string()),
             pa.field("vector", pa.list_(pa.float32(), embedding_dimension)),
             pa.field("created_at", pa.string()),
+            pa.field("metadata_json", pa.string()),
+            pa.field("retention_purge_after_utc", pa.string()),
         ]
     )
 
@@ -128,6 +131,65 @@ class MultiTenantVectorStore:
             return ""
         return str(value)
 
+    @staticmethod
+    def _row_value(row: Any, key: str, default: Any = None) -> Any:
+        getter = getattr(row, "get", None)
+        if callable(getter):
+            return getter(key, default)
+        try:
+            return row[key]
+        except (KeyError, TypeError, IndexError):
+            return default
+
+    @staticmethod
+    def _metadata_from_json(value: Any) -> dict[str, Any]:
+        if not isinstance(value, str) or not value.strip():
+            return {}
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return dict(decoded) if isinstance(decoded, dict) else {}
+
+    @staticmethod
+    def _metadata_to_json(value: Any) -> str:
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise ValueError("memory entry metadata must be an object")
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("memory entry metadata must be JSON serializable") from exc
+
+    @staticmethod
+    def _canonical_utc(value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+        if parsed.tzinfo is None:
+            return ""
+        return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    @classmethod
+    def _temporary_review_purge_after(cls, metadata: Any) -> str | None:
+        """Return an expiry only for explicitly non-canonical review evidence."""
+        if not isinstance(metadata, dict):
+            return None
+        if (
+            metadata.get("temporary") is not True
+            or metadata.get("canonical") is not False
+            or metadata.get("retention_verified") is not True
+            or metadata.get("record_kind") != "temporary_review_evidence"
+        ):
+            return None
+        expiry = cls._canonical_utc(metadata.get("purge_after_utc"))
+        return expiry or None
+
     def _row_to_entry(self, row: Any) -> MemoryEntry:
         return MemoryEntry(
             entry_id=str(row["entry_id"]),
@@ -138,6 +200,7 @@ class MultiTenantVectorStore:
             persons=self._list_or_empty(row["persons"]),
             entities=self._list_or_empty(row["entities"]),
             topic=row["topic"] if row["topic"] else None,
+            metadata=self._metadata_from_json(self._row_value(row, "metadata_json")),
         )
 
     def _row_to_record(
@@ -171,7 +234,46 @@ class MultiTenantVectorStore:
             "topic": self._text_or_empty(updates.get("topic", row["topic"] or "")),
             "vector": vector,
             "created_at": self._text_or_empty(row["created_at"] or ""),
+            "metadata_json": self._text_or_empty(
+                self._row_value(row, "metadata_json", "")
+            ),
+            "retention_purge_after_utc": self._text_or_empty(
+                self._row_value(row, "retention_purge_after_utc", "")
+            ),
         }
+
+    def _ensure_metadata_columns(self, table_name: str, table: Any) -> Any:
+        """Apply only the additive metadata migration required by this release."""
+        schema = getattr(table, "schema", None)
+        names = getattr(schema, "names", None)
+        if names is None:
+            # Lightweight test doubles need not emulate the complete Lance API.
+            return table
+        missing = [
+            field
+            for field in (
+                pa.field("metadata_json", pa.string()),
+                pa.field("retention_purge_after_utc", pa.string()),
+            )
+            if field.name not in names
+        ]
+        if not missing:
+            return table
+        add_columns = getattr(table, "add_columns", None)
+        if not callable(add_columns):
+            raise RuntimeError(
+                "LanceDB table does not support required additive metadata migration"
+            )
+        try:
+            add_columns(missing)
+            migrated = self.db.open_table(table_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"LanceDB metadata migration failed for table {table_name}"
+            ) from exc
+        self._tables[table_name] = migrated
+        self._table_dimensions.pop(table_name, None)
+        return migrated
 
     def _get_table(self, table_name: str) -> Any:
         """Get or create a user's table"""
@@ -186,6 +288,9 @@ class MultiTenantVectorStore:
                         table_name,
                         schema=schema,
                     )
+            self._tables[table_name] = self._ensure_metadata_columns(
+                table_name, self._tables[table_name]
+            )
             self._table_dimensions[table_name] = self._infer_table_dimension(
                 self._tables[table_name]
             )
@@ -273,6 +378,7 @@ class MultiTenantVectorStore:
         # Build records
         records = []
         for entry, embedding in zip(entries, embeddings):
+            metadata = getattr(entry, "metadata", {})
             records.append(
                 {
                     "entry_id": entry.entry_id,
@@ -285,6 +391,10 @@ class MultiTenantVectorStore:
                     "topic": entry.topic or "",
                     "vector": self._adapt_vector(embedding, table_dim),
                     "created_at": created_at,
+                    "metadata_json": self._metadata_to_json(metadata),
+                    "retention_purge_after_utc": self._temporary_review_purge_after(
+                        metadata
+                    ),
                 }
             )
 
@@ -322,28 +432,7 @@ class MultiTenantVectorStore:
                 lambda: table.search(query_vec).limit(top_k).to_pandas()
             )
 
-            entries = []
-            for _, row in results.iterrows():
-                entries.append(
-                    MemoryEntry(
-                        entry_id=row["entry_id"],
-                        lossless_restatement=row["lossless_restatement"],
-                        keywords=list(row["keywords"])
-                        if row["keywords"] is not None
-                        else [],
-                        timestamp=row["timestamp"] if row["timestamp"] else None,
-                        location=row["location"] if row["location"] else None,
-                        persons=list(row["persons"])
-                        if row["persons"] is not None
-                        else [],
-                        entities=list(row["entities"])
-                        if row["entities"] is not None
-                        else [],
-                        topic=row["topic"] if row["topic"] else None,
-                    )
-                )
-
-            return entries
+            return [self._row_to_entry(row) for _, row in results.iterrows()]
 
         except Exception as e:
             print(f"Semantic search error: {e}")
@@ -398,29 +487,7 @@ class MultiTenantVectorStore:
             scores.sort(key=lambda x: x[1], reverse=True)
             top_indices = [idx for idx, score in scores[:top_k] if score > 0]
 
-            entries = []
-            for idx in top_indices:
-                row = df.iloc[idx]
-                entries.append(
-                    MemoryEntry(
-                        entry_id=row["entry_id"],
-                        lossless_restatement=row["lossless_restatement"],
-                        keywords=list(row["keywords"])
-                        if row["keywords"] is not None
-                        else [],
-                        timestamp=row["timestamp"] if row["timestamp"] else None,
-                        location=row["location"] if row["location"] else None,
-                        persons=list(row["persons"])
-                        if row["persons"] is not None
-                        else [],
-                        entities=list(row["entities"])
-                        if row["entities"] is not None
-                        else [],
-                        topic=row["topic"] if row["topic"] else None,
-                    )
-                )
-
-            return entries
+            return [self._row_to_entry(df.iloc[idx]) for idx in top_indices]
 
         except Exception as e:
             print(f"Keyword search error: {e}")
@@ -505,28 +572,7 @@ class MultiTenantVectorStore:
             # Get filtered results
             filtered_df = df[[m for m in mask]][:top_k]
 
-            entries = []
-            for _, row in filtered_df.iterrows():
-                entries.append(
-                    MemoryEntry(
-                        entry_id=row["entry_id"],
-                        lossless_restatement=row["lossless_restatement"],
-                        keywords=list(row["keywords"])
-                        if row["keywords"] is not None
-                        else [],
-                        timestamp=row["timestamp"] if row["timestamp"] else None,
-                        location=row["location"] if row["location"] else None,
-                        persons=list(row["persons"])
-                        if row["persons"] is not None
-                        else [],
-                        entities=list(row["entities"])
-                        if row["entities"] is not None
-                        else [],
-                        topic=row["topic"] if row["topic"] else None,
-                    )
-                )
-
-            return entries
+            return [self._row_to_entry(row) for _, row in filtered_df.iterrows()]
 
         except Exception as e:
             print(f"Structured search error: {e}")
@@ -541,29 +587,7 @@ class MultiTenantVectorStore:
                 return []
 
             df = await asyncio.to_thread(table.to_pandas)
-            entries = []
-
-            for _, row in df.iterrows():
-                entries.append(
-                    MemoryEntry(
-                        entry_id=row["entry_id"],
-                        lossless_restatement=row["lossless_restatement"],
-                        keywords=list(row["keywords"])
-                        if row["keywords"] is not None
-                        else [],
-                        timestamp=row["timestamp"] if row["timestamp"] else None,
-                        location=row["location"] if row["location"] else None,
-                        persons=list(row["persons"])
-                        if row["persons"] is not None
-                        else [],
-                        entities=list(row["entities"])
-                        if row["entities"] is not None
-                        else [],
-                        topic=row["topic"] if row["topic"] else None,
-                    )
-                )
-
-            return entries
+            return [self._row_to_entry(row) for _, row in df.iterrows()]
 
         except Exception as e:
             print(f"Get all entries error: {e}")
@@ -588,6 +612,93 @@ class MultiTenantVectorStore:
         except Exception as e:
             print(f"Get entry error: {e}")
             return None
+
+    def _purge_expired_temporary_review_entries(
+        self,
+        table_name: str,
+        *,
+        now_utc: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Delete only expired, verified, non-canonical review evidence by ID."""
+        cutoff = self._canonical_utc(now_utc)
+        if not cutoff:
+            raise ValueError("temporary evidence cleanup requires timezone-aware now_utc")
+        cap = max(1, min(256, int(limit)))
+        with self._table_write_lock(table_name):
+            table = self._get_table(table_name)
+            where = (
+                "retention_purge_after_utc > '' AND retention_purge_after_utc <= "
+                f"'{self._escape_filter_value(cutoff)}'"
+            )
+            try:
+                matches = table.search().where(where).limit(cap).to_pandas()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"LanceDB temporary-evidence retention query failed for table {table_name}"
+                ) from exc
+
+            receipt: dict[str, Any] = {
+                "table_name": table_name,
+                "cutoff_utc": cutoff,
+                "selected": int(len(matches.index)),
+                "deleted": [],
+                "skipped": [],
+            }
+            for _, row in matches.iterrows():
+                entry_id = str(self._row_value(row, "entry_id", "") or "").strip()
+                metadata = self._metadata_from_json(
+                    self._row_value(row, "metadata_json")
+                )
+                stored_expiry = self._canonical_utc(
+                    self._row_value(row, "retention_purge_after_utc")
+                )
+                proven_expiry = self._temporary_review_purge_after(metadata)
+                if (
+                    not entry_id
+                    or not stored_expiry
+                    or proven_expiry != stored_expiry
+                    or stored_expiry > cutoff
+                ):
+                    receipt["skipped"].append(
+                        {"entry_id": entry_id, "reason": "retention_proof_mismatch"}
+                    )
+                    continue
+                entry_where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
+                try:
+                    table.delete(entry_where)
+                    remaining = table.search().where(entry_where).limit(1).to_pandas()
+                except Exception as exc:
+                    receipt["skipped"].append(
+                        {"entry_id": entry_id, "reason": f"delete_failed:{type(exc).__name__}"}
+                    )
+                    continue
+                if not remaining.empty:
+                    receipt["skipped"].append(
+                        {"entry_id": entry_id, "reason": "delete_not_confirmed"}
+                    )
+                    continue
+                receipt["deleted"].append(
+                    {"entry_id": entry_id, "purge_after_utc": stored_expiry}
+                )
+            return receipt
+
+    async def purge_expired_temporary_review_entries(
+        self,
+        table_name: str,
+        *,
+        now_utc: str | None = None,
+        limit: int = 32,
+    ) -> dict[str, Any]:
+        """Run a bounded exact-ID cleanup without materializing the full table."""
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return await asyncio.to_thread(
+            self._purge_expired_temporary_review_entries,
+            table_name,
+            now_utc=now_utc,
+            limit=limit,
+        )
 
     async def delete_entry(self, table_name: str, entry_id: str) -> dict[str, Any]:
         """Delete one entry by ID from a user's table."""

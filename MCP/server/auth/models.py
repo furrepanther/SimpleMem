@@ -4,7 +4,7 @@ Data models for authentication
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 import hashlib
 import uuid
 
@@ -97,6 +97,10 @@ class MemoryEntry:
     persons: list = field(default_factory=list)
     entities: list = field(default_factory=list)
     topic: Optional[str] = None
+    # Source-owned metadata is retained separately from retrieval/reranking
+    # fields so exact identity reads can prove lifecycle state without changing
+    # ranking inputs.
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -108,6 +112,7 @@ class MemoryEntry:
             "persons": self.persons,
             "entities": self.entities,
             "topic": self.topic,
+            "metadata": self.metadata,
         }
 
     @classmethod
@@ -121,6 +126,11 @@ class MemoryEntry:
             persons=data.get("persons", []),
             entities=data.get("entities", []),
             topic=data.get("topic"),
+            metadata=(
+                dict(data.get("metadata", {}))
+                if isinstance(data.get("metadata", {}), dict)
+                else {}
+            ),
         )
 
 

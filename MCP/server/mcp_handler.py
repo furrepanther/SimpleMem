@@ -278,8 +278,75 @@ class MCPHandler:
             cls._worker_tasks = []
 
     @classmethod
+    async def _sweep_expired_temporary_review_evidence(cls) -> dict[str, Any]:
+        """Sweep a bounded number of explicitly expired temporary review records."""
+        settings = cls._shared_settings
+        vector_store = cls._shared_vector_store
+        user_store = cls._shared_user_store
+        if settings is None or vector_store is None or user_store is None:
+            return {"status": "skipped", "reason": "retention_dependencies_unavailable"}
+
+        max_records = max(
+            1,
+            int(
+                getattr(settings, "memory_temporary_evidence_purge_batch_size", 32)
+            ),
+        )
+        max_tables = max(
+            1,
+            int(
+                getattr(settings, "memory_temporary_evidence_purge_max_tables", 128)
+            ),
+        )
+        try:
+            users = user_store.list_users(limit=max_tables)
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "reason": f"user_table_enumeration_failed:{type(exc).__name__}",
+            }
+
+        remaining = max_records
+        receipts: list[dict[str, Any]] = []
+        for user in users:
+            table_name = str(getattr(user, "table_name", "") or "").strip()
+            if not table_name or remaining <= 0:
+                break
+            try:
+                receipt = await vector_store.purge_expired_temporary_review_entries(
+                    table_name,
+                    limit=remaining,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                receipts.append(
+                    {
+                        "table_name": table_name,
+                        "error": f"sweep_failed:{type(exc).__name__}",
+                    }
+                )
+                continue
+            selected = max(0, int(receipt.get("selected", 0) or 0))
+            remaining = max(0, remaining - selected)
+            if selected or receipt.get("deleted") or receipt.get("skipped"):
+                receipts.append(receipt)
+
+        deleted_count = sum(
+            len(item.get("deleted", []))
+            for item in receipts
+            if isinstance(item.get("deleted"), list)
+        )
+        return {
+            "status": "complete",
+            "scope": "expired_temporary_review_evidence_only",
+            "deleted_count": deleted_count,
+            "receipts": receipts,
+        }
+
+    @classmethod
     async def _durable_retention_loop(cls) -> None:
-        """Bound operational queue growth without deleting canonical memories."""
+        """Bound queue growth and sweep only expired, non-canonical review evidence."""
         await asyncio.sleep(60)
         while True:
             settings = cls._shared_settings
@@ -296,6 +363,40 @@ class MCPHandler:
                 except Exception as exc:
                     logging.getLogger(__name__).warning(
                         "durable_retention_error: %s", exc, exc_info=True
+                    )
+                try:
+                    evidence_receipt = await cls._sweep_expired_temporary_review_evidence()
+                    if evidence_receipt.get("deleted_count", 0):
+                        cls._invalidate_memory_caches()
+                        logging.getLogger(__name__).info(
+                            "temporary_review_evidence_retention_receipt=%s",
+                            json.dumps(evidence_receipt, ensure_ascii=False, sort_keys=True),
+                        )
+                    elif evidence_receipt.get("status") in {"failed", "skipped"}:
+                        logging.getLogger(__name__).warning(
+                            "temporary_review_evidence_retention_%s=%s",
+                            evidence_receipt.get("status"),
+                            evidence_receipt.get("reason", "unknown"),
+                        )
+                    else:
+                        skipped_count = sum(
+                            len(item.get("skipped", []))
+                            for item in evidence_receipt.get("receipts", [])
+                            if isinstance(item, dict)
+                            and isinstance(item.get("skipped"), list)
+                        )
+                        if skipped_count:
+                            logging.getLogger(__name__).warning(
+                                "temporary_review_evidence_retention_proof_mismatch_count=%s",
+                                skipped_count,
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "temporary_review_evidence_retention_error: %s",
+                        exc,
+                        exc_info=True,
                     )
             await asyncio.sleep(
                 max(60, int(getattr(settings, "memory_write_purge_interval_s", 3600)))
@@ -813,8 +914,10 @@ class MCPHandler:
         return re.sub(r"\s+", " ", str(query or "").strip().lower())
 
     @staticmethod
-    def _local_entry_to_retrieval_result(entry: MemoryEntry) -> dict[str, Any]:
-        return {
+    def _local_entry_to_retrieval_result(
+        entry: MemoryEntry, *, include_metadata: bool = False
+    ) -> dict[str, Any]:
+        result = {
             "entry_id": entry.entry_id,
             "content": entry.lossless_restatement,
             "timestamp": entry.timestamp,
@@ -823,6 +926,9 @@ class MCPHandler:
             "entities": entry.entities,
             "topic": entry.topic,
         }
+        if include_metadata:
+            result["metadata"] = dict(entry.metadata)
+        return result
 
     @staticmethod
     def _retrieval_result_identity(result: dict[str, Any]) -> str:
@@ -879,7 +985,11 @@ class MCPHandler:
         if local_entry is not None:
             return {
                 "query": query,
-                "results": [self._local_entry_to_retrieval_result(local_entry)],
+                "results": [
+                    self._local_entry_to_retrieval_result(
+                        local_entry, include_metadata=True
+                    )
+                ],
                 "total": 1,
             }
 
@@ -1019,6 +1129,17 @@ class MCPHandler:
         return [part.strip() for part in text.split(",") if part.strip()]
 
     @staticmethod
+    def _canonical_metadata_json(value: Any) -> str:
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise ValueError("memory_store metadata must be an object")
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("memory_store metadata must be JSON serializable") from exc
+
+    @staticmethod
     def _derive_keywords_for_memory_store(
         args: dict[str, Any], content: str
     ) -> list[str]:
@@ -1072,6 +1193,11 @@ class MCPHandler:
             persons=[],
             entities=[],
             topic=topic,
+            metadata=(
+                dict(args.get("metadata", {}))
+                if isinstance(args.get("metadata", {}), dict)
+                else {}
+            ),
         )
 
     def _compute_idempotency_key(self, *, kind: str, args: dict[str, Any]) -> str:
@@ -1093,6 +1219,7 @@ class MCPHandler:
                 "pointer": str(args.get("pointer", "") or "").strip(),
                 "status": str(args.get("status", "") or "").strip(),
                 "tags": self._string_list_arg(args.get("tags", [])),
+                "metadata": self._canonical_metadata_json(args.get("metadata", {})),
             }
         elif kind == "memory_add":
             content = str(args.get("content", args.get("text", ""))).strip()
@@ -1141,6 +1268,7 @@ class MCPHandler:
                 "tags": args.get("tags", []),
                 "pointer": args.get("pointer"),
                 "status": args.get("status"),
+                "metadata": dict(args.get("metadata", {})),
                 "table_name": self.user.table_name,
                 "user_id": self.user.user_id,
             }
@@ -1382,6 +1510,7 @@ class MCPHandler:
                 "Use memory_store for durable single-entry writes (memory_add is a legacy alias). "
                 "Use memory_add_batch for durable batch writes. "
                 "Use memory_delete and memory_update for targeted single-memory mutation. "
+                "Use memory_cleanup_expired only to obtain a bounded receipt for expired temporary review evidence. "
                 "Writes are accepted only after durable enqueue and return a job_id. "
                 "Use memory_job_status for completion state."
             ),
@@ -1640,6 +1769,19 @@ class MCPHandler:
                     },
                 },
                 {
+                    "name": "memory_cleanup_expired",
+                    "description": "Delete only expired, verified, non-canonical temporary review evidence for the authenticated user and return exact-ID receipts.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Optional bounded maximum records to inspect and delete",
+                            }
+                        },
+                    },
+                },
+                {
                     "name": "memory_stats",
                     "description": "Return memory and queue statistics.",
                     "inputSchema": {"type": "object", "properties": {}},
@@ -1661,6 +1803,7 @@ class MCPHandler:
             "memory_retrieve": self._tool_memory_retrieve,
             "memory_delete": self._tool_memory_delete,
             "memory_update": self._tool_memory_update,
+            "memory_cleanup_expired": self._tool_memory_cleanup_expired,
             "memory_stats": self._tool_memory_stats,
         }
         handler = handlers.get(name)
@@ -1710,6 +1853,12 @@ class MCPHandler:
         max_metadata_chars = max(
             256, int(self.settings.memory_write_max_metadata_chars)
         )
+        metadata_json = self._canonical_metadata_json(args.get("metadata", {}))
+        if len(metadata_json) > max_metadata_chars:
+            raise ValueError(
+                f"memory_store metadata exceeds {max_metadata_chars} characters"
+            )
+        normalized["metadata"] = json.loads(metadata_json)
         for key in (
             "category",
             "component",
@@ -2142,6 +2291,36 @@ class MCPHandler:
         if result.get("deleted") or result.get("queued"):
             MCPHandler._invalidate_memory_caches()
         return result
+
+    async def _tool_memory_cleanup_expired(self, args: dict) -> dict:
+        """Provide an on-demand, bounded receipt for expired review evidence."""
+        configured_limit = max(
+            1,
+            int(
+                getattr(
+                    self.settings,
+                    "memory_temporary_evidence_purge_batch_size",
+                    32,
+                )
+            ),
+        )
+        try:
+            requested_limit = int(args.get("limit", configured_limit))
+        except (TypeError, ValueError):
+            raise ValueError("memory_cleanup_expired limit must be an integer")
+        limit = max(1, min(configured_limit, requested_limit))
+        receipt = await self.vector_store.purge_expired_temporary_review_entries(
+            self.user.table_name,
+            limit=limit,
+        )
+        if receipt.get("deleted"):
+            MCPHandler._invalidate_memory_caches()
+        return {
+            "status": "complete",
+            "scope": "expired_temporary_review_evidence_only",
+            "limit": limit,
+            **receipt,
+        }
 
     async def _tool_memory_update(self, args: dict) -> dict:
         entry_id = self._entry_id_arg(args)

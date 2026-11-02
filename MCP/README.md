@@ -146,8 +146,10 @@ Mcp-Session-Id: <session-id>
 | `memory_add_batch` | Add multiple dialogues at once |
 | `memory_query` | Query memories and generate AI-synthesized answers (with planning + hybrid retrieval + reflection) |
 | `memory_retrieve` | Retrieve relevant memory entries (returns raw data) |
+| `memory_delete` | Delete one exact memory by ID and return its receipt |
+| `memory_update` | Update one exact memory by ID |
+| `memory_cleanup_expired` | Sweep only expired, verified, non-canonical temporary review evidence and return exact-ID receipts |
 | `memory_stats` | Get memory statistics |
-| `memory_clear` | Clear all memories (irreversible) |
 
 ## Client Configuration
 
@@ -157,7 +159,7 @@ Add to your MCP JSON settings:
 {
   "mcpServers": {
     "simplemem": {
-      "url": "https://mcp.simplemem.cloud/mcp",
+      "url": "http://127.0.0.1:8000/mcp",
       "headers": {
         "Authorization": "Bearer YOUR_TOKEN"
       }
@@ -263,6 +265,25 @@ User Question: "When am I meeting Bob?"
 | `max_reflection_rounds` | 2 | Maximum reflection rounds |
 | `llm_model` | granite-4.0-h-1b-Q4_K_S:latest | Loopback chat model |
 | `embedding_model` | BAAI/bge-m3 | Embedding model |
+
+### Temporary review-evidence lifecycle
+
+`memory_store` preserves a JSON-object `metadata` field on exact local reads.
+Metadata is not used as a retrieval or reranking input. A record is eligible for
+automatic retention cleanup only when all of these fields are present and exact:
+`temporary=true`, `canonical=false`, `retention_verified=true`,
+`record_kind=temporary_review_evidence`, and a timezone-aware
+`purge_after_utc` value.
+
+The existing retention worker runs at `MEMORY_WRITE_PURGE_INTERVAL_S` (default
+`300`) and uses bounded, exact-ID deletes. This is a data-retention schedule,
+not a liveness deadline or process-termination mechanism. It never deletes
+canonical memories, and it verifies each deletion before recording a receipt.
+
+| Environment variable | Default | Description |
+|---|---:|---|
+| `MEMORY_TEMPORARY_EVIDENCE_PURGE_BATCH_SIZE` | `32` | Maximum expired review-evidence records inspected in one retention pass; clamped to 1–256. |
+| `MEMORY_TEMPORARY_EVIDENCE_PURGE_MAX_TABLES` | `128` | Maximum user tables considered in one retention pass; clamped to 1–1000. |
 
 ## Development
 

@@ -392,6 +392,16 @@ class Settings:
             os.getenv("MEMORY_WRITE_PURGE_INTERVAL_S", "300")
         )
     )
+    memory_temporary_evidence_purge_batch_size: int = field(
+        default_factory=lambda: int(
+            os.getenv("MEMORY_TEMPORARY_EVIDENCE_PURGE_BATCH_SIZE", "32")
+        )
+    )
+    memory_temporary_evidence_purge_max_tables: int = field(
+        default_factory=lambda: int(
+            os.getenv("MEMORY_TEMPORARY_EVIDENCE_PURGE_MAX_TABLES", "128")
+        )
+    )
     memory_retrieve_max_top_k: int = field(
         default_factory=lambda: int(os.getenv("MEMORY_RETRIEVE_MAX_TOP_K", "16"))
     )
@@ -516,6 +526,12 @@ class Settings:
         )
         self.memory_write_purge_interval_s = max(
             60, int(self.memory_write_purge_interval_s)
+        )
+        self.memory_temporary_evidence_purge_batch_size = max(
+            1, min(256, int(self.memory_temporary_evidence_purge_batch_size))
+        )
+        self.memory_temporary_evidence_purge_max_tables = max(
+            1, min(1000, int(self.memory_temporary_evidence_purge_max_tables))
         )
         self.memory_retrieve_max_top_k = max(1, int(self.memory_retrieve_max_top_k))
         self.memory_retrieve_max_query_chars = max(
