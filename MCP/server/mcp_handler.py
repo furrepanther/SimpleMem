@@ -2077,6 +2077,12 @@ class MCPHandler:
                 )
             owner_future.set_result(dict(result))
             return result
+        except asyncio.CancelledError:
+            # Coalesced callers await the owner future rather than the owner
+            # task.  Settle it on disconnect/cancellation so they cannot wait
+            # forever after the owner exits.
+            owner_future.cancel()
+            raise
         except Exception as exc:
             owner_future.set_exception(exc)
             # The owner raises directly; coalesced waiters still await this error.

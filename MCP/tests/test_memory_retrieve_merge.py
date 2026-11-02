@@ -162,6 +162,56 @@ def test_default_lookup_preserves_semantic_merge_order() -> None:
     ]
 
 
+def test_retrieve_owner_disconnect_cancels_coalesced_waiter_without_cache() -> None:
+    async def exercise() -> None:
+        MCPHandler._invalidate_memory_caches()
+        MCPHandler._retrieve_inflight.clear()
+        MCPHandler._retrieve_inflight_ts.clear()
+        handler = _retrieval_handler()
+        started = asyncio.Event()
+
+        async def exact(*, query: str, top_k: int) -> dict:
+            started.set()
+            await asyncio.Event().wait()
+            return {"query": query, "results": [], "total": 0}
+
+        handler._memory_retrieve_exact = exact
+        owner = asyncio.create_task(
+            handler._tool_memory_retrieve(
+                {"query": "disconnect fixture", "force_exact": True}
+            )
+        )
+        waiter = None
+        try:
+            await started.wait()
+            waiter = asyncio.create_task(
+                handler._tool_memory_retrieve(
+                    {"query": "disconnect fixture", "force_exact": True}
+                )
+            )
+            await asyncio.sleep(0)
+            owner.cancel()
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(owner, waiter, return_exceptions=True), timeout=0.5
+            )
+            assert all(isinstance(item, asyncio.CancelledError) for item in outcomes)
+            assert not MCPHandler._retrieve_inflight
+            assert not MCPHandler._retrieve_cache
+        finally:
+            for task in (owner, waiter):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (owner, waiter) if task is not None),
+                return_exceptions=True,
+            )
+            MCPHandler._invalidate_memory_caches()
+            MCPHandler._retrieve_inflight.clear()
+            MCPHandler._retrieve_inflight_ts.clear()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("invalid", ["false", "true", 0, 1, None, []])
 def test_exact_lookup_rejects_nonboolean_flags(invalid) -> None:
     handler = _retrieval_handler()
