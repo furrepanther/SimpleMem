@@ -25,7 +25,7 @@ async function handleRegister(e) {
 
     const apiKey = apiKeyInput.value.trim();
     if (!apiKey) {
-        showError('Please enter your OpenRouter API key.');
+        showError('Please enter a local service credential.');
         return;
     }
 

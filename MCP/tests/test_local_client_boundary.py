@@ -1,9 +1,13 @@
 from unittest.mock import patch
+from pathlib import Path
 
 import pytest
 
 from config.settings import Settings
 from server.integrations.openrouter import OpenRouterClient, OpenRouterClientManager
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize("factory,kwargs", [
@@ -72,3 +76,17 @@ def test_unset_llm_model_falls_back_to_canonical_granite(monkeypatch, tmp_path):
     assert settings.llm_model == "granite-4.0-h-1b-Q4_K_S:latest"
     assert OpenRouterClient("fixture", base).llm_model == settings.llm_model
     assert OpenRouterClientManager(base).llm_model == settings.llm_model
+
+
+def test_registration_ui_never_requests_a_cloud_provider_key():
+    index = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
+    app = (ROOT / "frontend" / "app.js").read_text(encoding="utf-8")
+
+    assert "Local Service Credential" in index
+    assert "Do not enter a cloud-provider key." in index
+    assert "Register Another Credential" in index
+    assert "OpenRouter API key" not in index
+    assert "OpenRouter API key" not in app
+    assert "local service credential" in app
+    assert "openrouter.ai" not in index
+    assert "openrouter.ai" not in app
