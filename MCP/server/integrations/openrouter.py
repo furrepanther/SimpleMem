@@ -1,5 +1,5 @@
 """
-OpenRouter SDK integration for LLM and Embedding services
+OpenAI-compatible local-inference integration for LLM and embedding services.
 """
 
 import json
@@ -55,7 +55,7 @@ class OpenRouterClient:
         base_url: str,
         embedding_base_url: Optional[str] = None,
         rerank_base_url: Optional[str] = None,
-        llm_model: str = "openai/gpt-4.1-mini",
+        llm_model: str = "granite-4.0-h-1b-Q4_K_S:latest",
         embedding_model: str = "BAAI/bge-m3",
         reranker_model: str = "BAAI/bge-reranker-v2-m3",
     ):
@@ -555,7 +555,7 @@ class OpenRouterClientManager:
         base_url: str,
         embedding_base_url: Optional[str] = None,
         rerank_base_url: Optional[str] = None,
-        llm_model: str = "openai/gpt-4.1-mini",
+        llm_model: str = "granite-4.0-h-1b-Q4_K_S:latest",
         embedding_model: str = "BAAI/bge-m3",
         reranker_model: str = "BAAI/bge-reranker-v2-m3",
     ):

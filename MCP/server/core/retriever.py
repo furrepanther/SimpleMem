@@ -656,7 +656,7 @@ Return ONLY valid JSON."""
         return await self._maybe_rerank(query, merged)
 
     def _build_query_instruction(self, query: str, question_type: Optional[str] = None) -> str:
-        """Build a Qwen3-style query-side instruction in English."""
+        """Build the canonical query-side retrieval instruction in English."""
         q = (query or "").strip().lower()
         qt = (question_type or "").strip().lower()
 

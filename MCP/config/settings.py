@@ -79,7 +79,9 @@ class Settings:
 
     # Common LLM Configuration
     llm_model: str = field(
-        default_factory=lambda: os.getenv("LLM_MODEL", "openai/gpt-4.1-mini")
+        default_factory=lambda: os.getenv(
+            "LLM_MODEL", "granite-4.0-h-1b-Q4_K_S:latest"
+        )
     )
     embedding_model: str = field(
         default_factory=lambda: os.getenv(

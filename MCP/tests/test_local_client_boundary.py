@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
+from config.settings import Settings
 from server.integrations.openrouter import OpenRouterClient, OpenRouterClientManager
 
 
@@ -51,3 +52,23 @@ def test_explicit_local_endpoints_and_fallback_are_preserved():
     assert (fallback.base_url, fallback.embedding_base_url, fallback.rerank_base_url) == (base, embed, embed)
     all_fallback = OpenRouterClientManager(base).get_client("fixture")
     assert (all_fallback.base_url, all_fallback.embedding_base_url, all_fallback.rerank_base_url) == (base, base, base)
+
+
+def test_unset_llm_model_falls_back_to_canonical_granite(monkeypatch, tmp_path):
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    base = "http://127.0.0.1:11437/v1"
+    embed = "http://127.0.0.1:11501/v1"
+    rerank = "http://127.0.0.1:11502/v1"
+    settings = Settings(
+        jwt_secret_key="j" * 64,
+        encryption_key="e" * 64,
+        data_dir=str(tmp_path / "data"),
+        lancedb_path=str(tmp_path / "lancedb"),
+        durable_queue_db_path=str(tmp_path / "queue.db"),
+        openrouter_base_url=base,
+        openrouter_embedding_base_url=embed,
+        openrouter_rerank_base_url=rerank,
+    )
+    assert settings.llm_model == "granite-4.0-h-1b-Q4_K_S:latest"
+    assert OpenRouterClient("fixture", base).llm_model == settings.llm_model
+    assert OpenRouterClientManager(base).llm_model == settings.llm_model

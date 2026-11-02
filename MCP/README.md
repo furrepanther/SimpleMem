@@ -2,7 +2,7 @@
 
 **Production-Ready Memory Service for LLM Agents via Model Context Protocol (MCP)**
 
-SimpleMem MCP Server is a cloud-hosted long-term memory service for LLM agents, implementing the **Streamable HTTP** transport (MCP 2025-03-26 spec). It enables AI assistants like Claude, Cursor, and other MCP-compatible clients to store, retrieve, and query conversational memories with ease.
+SimpleMem MCP Server is a local-only long-term memory service for LLM agents, implementing the **Streamable HTTP** transport (MCP 2025-03-26 spec). It enables MCP-compatible clients to store, retrieve, and query conversational memories without direct cloud-provider inference.
 
 ## Features
 
@@ -12,7 +12,7 @@ SimpleMem MCP Server is a cloud-hosted long-term memory service for LLM agents, 
 - **Hybrid Retrieval**: Semantic search + keyword matching + metadata filtering
 - **Intelligent Planning**: Automatic query decomposition and reflection for complex queries
 - **Multi-tenant Isolation**: Per-user data tables with token authentication
-- **OpenRouter Integration**: Powered by OpenRouter's LLM and Embedding services
+- **Local-only Inference**: Chat, embedding, and reranking use configured loopback endpoints only
 - **Production Optimized**: Faster response times compared to the academic reference implementation
 
 ## Architecture
@@ -45,8 +45,8 @@ SimpleMem MCP Server is a cloud-hosted long-term memory service for LLM agents, 
 │  └─────────────────── LanceDB ──────────────────────────┘     │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │               OpenRouter API Integration                  │  │
-│  │  LLM: openai/gpt-4.1-mini    Embed: BAAI/bge-m3                │  │
+│  │          OpenAI-compatible Local Inference                │  │
+│  │  LLM: Granite 4.0 H 1B       Embed: BAAI/bge-m3           │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -54,14 +54,12 @@ SimpleMem MCP Server is a cloud-hosted long-term memory service for LLM agents, 
 
 ## Quick Start
 
-### Using the Cloud Service
+### Production Deployment (Local-only)
 
-The easiest way to use SimpleMem is via our hosted service at **https://mcp.simplemem.cloud**
-
-1. Visit `https://mcp.simplemem.cloud`
-2. Enter your OpenRouter API Key
-3. Get your authentication token
-4. Configure your MCP client (see below)
+This production fork never calls a cloud provider directly. It uses loopback
+endpoints for Granite chat inference, BGE-M3 embeddings, and the BGE reranker.
+The canonical model root is `/var/lib/models/llama`; model-server ownership and
+lifecycle remain outside SimpleMem.
 
 ### Self-Hosting
 
@@ -80,6 +78,10 @@ pip install -r requirements.txt
 # Production environment recommended settings
 export JWT_SECRET_KEY="your-secure-random-secret-key"
 export ENCRYPTION_KEY="your-32-byte-encryption-key!!"
+export LLM_MODEL="granite-4.0-h-1b-Q4_K_S:latest"
+export OPENROUTER_BASE_URL="http://127.0.0.1:11437/v1"
+export OPENROUTER_EMBED_BASE_URL="http://127.0.0.1:11501/v1"
+export OPENROUTER_RERANK_BASE_URL="http://127.0.0.1:11502/v1"
 ```
 
 #### 3. Start the Server
@@ -259,7 +261,7 @@ User Question: "When am I meeting Bob?"
 | `enable_planning` | true | Enable query planning |
 | `enable_reflection` | true | Enable reflection iteration |
 | `max_reflection_rounds` | 2 | Maximum reflection rounds |
-| `llm_model` | openai/gpt-4.1-mini | LLM model |
+| `llm_model` | granite-4.0-h-1b-Q4_K_S:latest | Loopback chat model |
 | `embedding_model` | BAAI/bge-m3 | Embedding model |
 
 ## Development
