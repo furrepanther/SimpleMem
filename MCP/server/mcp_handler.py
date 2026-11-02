@@ -1267,9 +1267,11 @@ class MCPHandler:
         if MCPHandler._read_gate_lock is None:
             MCPHandler._read_gate_lock = asyncio.Lock()
         async with MCPHandler._read_gate_lock:
-            if MCPHandler._active_read_ops >= max(
-                1, int(self.settings.memory_queue_max_inflight_reads)
-            ):
+            read_limit = max(
+                1,
+                int(getattr(self.settings, "memory_queue_max_inflight_reads", 48)),
+            )
+            if MCPHandler._active_read_ops >= read_limit:
                 MCPHandler._read_rejects += 1
                 MCPHandler._user_read_reject(self.user.user_id)
                 raise RuntimeError(
@@ -2034,7 +2036,14 @@ class MCPHandler:
             cache_key,
             owner_future,
         )
+        gate_entered = False
         try:
+            # Cache hits and same-key coalesced callers return above; every
+            # distinct live retrieval must still respect the shared read cap.
+            # This bounds local embedding, LanceDB, and reranker work without
+            # changing result ordering, candidate counts, or request sizing.
+            await self._enter_read_gate()
+            gate_entered = True
             if force_exact:
                 result = await self._memory_retrieve_exact(
                     query=query,
@@ -2097,6 +2106,8 @@ class MCPHandler:
                     cache_key,
                     owner_future,
                 )
+            if gate_entered:
+                await self._exit_read_gate()
 
     def _entry_id_arg(self, args: dict) -> str:
         return str(args.get("entry_id") or args.get("memory_id") or "").strip()

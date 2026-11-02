@@ -99,6 +99,7 @@ def _retrieval_handler() -> MCPHandler:
     handler.settings = SimpleNamespace(
         memory_retrieve_max_query_chars=4096,
         memory_retrieve_max_top_k=10,
+        memory_queue_max_inflight_reads=2,
     )
     return handler
 
@@ -205,6 +206,42 @@ def test_retrieve_owner_disconnect_cancels_coalesced_waiter_without_cache() -> N
                 *(task for task in (owner, waiter) if task is not None),
                 return_exceptions=True,
             )
+            MCPHandler._invalidate_memory_caches()
+            MCPHandler._retrieve_inflight.clear()
+            MCPHandler._retrieve_inflight_ts.clear()
+
+    asyncio.run(exercise())
+
+
+def test_retrieve_read_admission_failure_cleans_inflight_and_can_retry() -> None:
+    async def exercise() -> None:
+        handler = _retrieval_handler()
+        original_active = MCPHandler._active_read_ops
+
+        async def exact(*, query: str, top_k: int) -> dict:
+            return {"query": query, "results": [], "total": 0}
+
+        handler._memory_retrieve_exact = exact
+        try:
+            MCPHandler._active_read_ops = handler.settings.memory_queue_max_inflight_reads
+            with pytest.raises(RuntimeError, match="memory_query_overloaded"):
+                await handler._tool_memory_retrieve(
+                    {"query": "admission fixture", "force_exact": True}
+                )
+            assert not MCPHandler._retrieve_inflight
+            assert not MCPHandler._retrieve_cache
+
+            MCPHandler._active_read_ops = 0
+            result = await handler._tool_memory_retrieve(
+                {"query": "admission fixture", "force_exact": True}
+            )
+            assert result == {
+                "query": "admission fixture",
+                "results": [],
+                "total": 0,
+            }
+        finally:
+            MCPHandler._active_read_ops = original_active
             MCPHandler._invalidate_memory_caches()
             MCPHandler._retrieve_inflight.clear()
             MCPHandler._retrieve_inflight_ts.clear()
