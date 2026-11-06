@@ -128,6 +128,67 @@ def test_expired_review_cleanup_is_exact_bounded_and_preserves_other_records(tmp
     assert asyncio.run(store.get_entry("mem_global", "canonical")) is not None
 
 
+def test_proof_mismatch_is_deindexed_so_it_cannot_starve_later_expired_evidence(
+    tmp_path,
+) -> None:
+    store = MultiTenantVectorStore(str(tmp_path / "lancedb"), embedding_dimension=2)
+    now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+    expiry = "2026-11-01T00:00:00Z"
+    mismatched = _temporary_metadata(expiry, canonical=True)
+    valid = _temporary_metadata(expiry)
+
+    async def exercise() -> tuple[dict, dict, str]:
+        assert await store.add_entries(
+            "mem_global",
+            [_entry("mismatched", mismatched)],
+            [[1.0, 0.0]],
+        ) == 1
+        # Simulate a legacy/corrupt derived expiry index. The metadata remains
+        # canonical, so cleanup must retain this row while continuing past it.
+        table = store._get_table("mem_global")
+        table.update(
+            where="entry_id = 'mismatched'",
+            values={"retention_purge_after_utc": expiry},
+        )
+        first = await store.purge_expired_temporary_review_entries(
+            "mem_global",
+            now_utc=now.isoformat(),
+            limit=1,
+        )
+        deindexed = (
+            table.search()
+            .where("entry_id = 'mismatched'")
+            .limit(1)
+            .to_pandas()
+        )
+        assert len(deindexed.index) == 1
+        assert deindexed.iloc[0]["retention_purge_after_utc"] == ""
+        # A later valid row must not be starved by the retained unproven row.
+        assert await store.add_entries(
+            "mem_global", [_entry("valid", valid)], [[0.0, 1.0]]
+        ) == 1
+        second = await store.purge_expired_temporary_review_entries(
+            "mem_global",
+            now_utc=now.isoformat(),
+            limit=1,
+        )
+        return first, second, str(deindexed.iloc[0]["retention_purge_after_utc"])
+
+    first, second, mismatched_index = asyncio.run(exercise())
+    assert first["selected"] == 1
+    assert first["deindexed"] == [
+        {"entry_id": "mismatched", "reason": "retention_proof_mismatch"}
+    ]
+    assert mismatched_index == ""
+    mismatched_entry = asyncio.run(store.get_entry("mem_global", "mismatched"))
+    assert mismatched_entry is not None
+    assert mismatched_entry.metadata == mismatched
+    assert second["deleted"] == [
+        {"entry_id": "valid", "purge_after_utc": expiry}
+    ]
+    assert asyncio.run(store.get_entry("mem_global", "valid")) is None
+
+
 def test_memory_store_metadata_is_validated_and_included_in_idempotency() -> None:
     handler = object.__new__(MCPHandler)
     handler.user = User(user_id="metadata-user")

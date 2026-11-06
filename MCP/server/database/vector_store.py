@@ -644,6 +644,7 @@ class MultiTenantVectorStore:
                 "selected": int(len(matches.index)),
                 "deleted": [],
                 "skipped": [],
+                "deindexed": [],
             }
             for _, row in matches.iterrows():
                 entry_id = str(self._row_value(row, "entry_id", "") or "").strip()
@@ -660,8 +661,64 @@ class MultiTenantVectorStore:
                     or proven_expiry != stored_expiry
                     or stored_expiry > cutoff
                 ):
-                    receipt["skipped"].append(
+                    # The scalar expiry is an index derived from metadata, not
+                    # purge authority.  Preserve an unproven row and its
+                    # metadata, but clear a contradictory index entry so it
+                    # cannot monopolize every bounded cleanup page.
+                    if not entry_id:
+                        receipt["skipped"].append(
+                            {
+                                "entry_id": entry_id,
+                                "reason": "retention_proof_mismatch",
+                            }
+                        )
+                        continue
+                    entry_where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
+                    try:
+                        table.update(
+                            where=entry_where,
+                            values={"retention_purge_after_utc": ""},
+                        )
+                        indexed = (
+                            table.search()
+                            .where(entry_where)
+                            .limit(1)
+                            .to_pandas()
+                        )
+                    except Exception as exc:
+                        receipt["skipped"].append(
+                            {
+                                "entry_id": entry_id,
+                                "reason": (
+                                    "retention_proof_mismatch_deindex_failed:"
+                                    f"{type(exc).__name__}"
+                                ),
+                            }
+                        )
+                        continue
+                    if (
+                        indexed.empty
+                        or self._text_or_empty(
+                            self._row_value(
+                                indexed.iloc[0], "retention_purge_after_utc", None
+                            )
+                        )
+                    ):
+                        receipt["skipped"].append(
+                            {
+                                "entry_id": entry_id,
+                                "reason": "retention_proof_mismatch_deindex_unconfirmed",
+                            }
+                        )
+                        continue
+                    receipt["deindexed"].append(
                         {"entry_id": entry_id, "reason": "retention_proof_mismatch"}
+                    )
+                    receipt["skipped"].append(
+                        {
+                            "entry_id": entry_id,
+                            "reason": "retention_proof_mismatch_deindexed",
+                        }
                     )
                     continue
                 entry_where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
