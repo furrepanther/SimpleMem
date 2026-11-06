@@ -141,6 +141,36 @@ class MultiTenantVectorStore:
         except (KeyError, TypeError, IndexError):
             return default
 
+    @classmethod
+    def _retention_row_filter(
+        cls,
+        row: Any,
+        *,
+        retention_purge_after_utc: str | None = None,
+    ) -> str:
+        """Build a narrow mutable-row selector from retained scalar fields."""
+        values = {
+            "entry_id": cls._text_or_empty(cls._row_value(row, "entry_id", "")),
+            "lossless_restatement": cls._text_or_empty(
+                cls._row_value(row, "lossless_restatement", "")
+            ),
+            "created_at": cls._text_or_empty(cls._row_value(row, "created_at", "")),
+            "metadata_json": cls._text_or_empty(
+                cls._row_value(row, "metadata_json", "")
+            ),
+            "retention_purge_after_utc": (
+                cls._text_or_empty(retention_purge_after_utc)
+                if retention_purge_after_utc is not None
+                else cls._text_or_empty(
+                    cls._row_value(row, "retention_purge_after_utc", "")
+                )
+            ),
+        }
+        return " AND ".join(
+            f"{field} = '{cls._escape_filter_value(value)}'"
+            for field, value in values.items()
+        )
+
     @staticmethod
     def _metadata_from_json(value: Any) -> dict[str, Any]:
         if not isinstance(value, str) or not value.strip():
@@ -632,7 +662,12 @@ class MultiTenantVectorStore:
                 f"'{self._escape_filter_value(cutoff)}'"
             )
             try:
-                matches = table.search().where(where).limit(cap).to_pandas()
+                matches = (
+                    table.search()
+                    .where(where)
+                    .limit(cap)
+                    .to_pandas()
+                )
             except Exception as exc:
                 raise RuntimeError(
                     f"LanceDB temporary-evidence retention query failed for table {table_name}"
@@ -655,6 +690,31 @@ class MultiTenantVectorStore:
                     self._row_value(row, "retention_purge_after_utc")
                 )
                 proven_expiry = self._temporary_review_purge_after(metadata)
+                row_where = self._retention_row_filter(row)
+                try:
+                    exact_matches = (
+                        table.search().where(row_where).limit(2).to_pandas()
+                    )
+                except Exception as exc:
+                    receipt["skipped"].append(
+                        {
+                            "entry_id": entry_id,
+                            "reason": f"retention_row_identity_probe_failed:{type(exc).__name__}",
+                        }
+                    )
+                    continue
+                if len(exact_matches.index) != 1:
+                    receipt["skipped"].append(
+                        {
+                            "entry_id": entry_id,
+                            "reason": (
+                                "retention_row_identity_missing"
+                                if exact_matches.empty
+                                else "retention_row_identity_ambiguous"
+                            ),
+                        }
+                    )
+                    continue
                 if (
                     not entry_id
                     or not stored_expiry
@@ -673,16 +733,19 @@ class MultiTenantVectorStore:
                             }
                         )
                         continue
-                    entry_where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
                     try:
                         table.update(
-                            where=entry_where,
+                            where=row_where,
                             values={"retention_purge_after_utc": ""},
                         )
                         indexed = (
                             table.search()
-                            .where(entry_where)
-                            .limit(1)
+                            .where(
+                                self._retention_row_filter(
+                                    row, retention_purge_after_utc=""
+                                )
+                            )
+                            .limit(2)
                             .to_pandas()
                         )
                     except Exception as exc:
@@ -697,7 +760,7 @@ class MultiTenantVectorStore:
                         )
                         continue
                     if (
-                        indexed.empty
+                        len(indexed.index) != 1
                         or self._text_or_empty(
                             self._row_value(
                                 indexed.iloc[0], "retention_purge_after_utc", None
@@ -721,10 +784,9 @@ class MultiTenantVectorStore:
                         }
                     )
                     continue
-                entry_where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
                 try:
-                    table.delete(entry_where)
-                    remaining = table.search().where(entry_where).limit(1).to_pandas()
+                    table.delete(row_where)
+                    remaining = table.search().where(row_where).limit(1).to_pandas()
                 except Exception as exc:
                     receipt["skipped"].append(
                         {"entry_id": entry_id, "reason": f"delete_failed:{type(exc).__name__}"}

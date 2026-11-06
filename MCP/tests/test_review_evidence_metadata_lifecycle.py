@@ -155,6 +155,7 @@ def test_proof_mismatch_is_deindexed_so_it_cannot_starve_later_expired_evidence(
             now_utc=now.isoformat(),
             limit=1,
         )
+        assert first["deindexed"], first["skipped"]
         deindexed = (
             table.search()
             .where("entry_id = 'mismatched'")
@@ -187,6 +188,67 @@ def test_proof_mismatch_is_deindexed_so_it_cannot_starve_later_expired_evidence(
         {"entry_id": "valid", "purge_after_utc": expiry}
     ]
     assert asyncio.run(store.get_entry("mem_global", "valid")) is None
+
+
+def test_cleanup_uses_row_identity_when_legacy_rows_duplicate_entry_ids(tmp_path) -> None:
+    store = MultiTenantVectorStore(str(tmp_path / "lancedb"), embedding_dimension=2)
+    now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+    expiry = "2026-11-01T00:00:00Z"
+    mismatched = _temporary_metadata(expiry, canonical=True)
+    valid = _temporary_metadata(expiry)
+
+    async def exercise() -> tuple[dict, list[dict]]:
+        assert await store.add_entries(
+            "mem_global",
+            [_entry("duplicate", mismatched)],
+            [[1.0, 0.0]],
+        ) == 1
+        table = store._get_table("mem_global")
+        table.update(
+            where="entry_id = 'duplicate'",
+            values={"retention_purge_after_utc": expiry},
+        )
+        # Bypass the normal merge key to model a legacy/corrupt table that has
+        # duplicate entry IDs. Cleanup must still mutate only the row it proved.
+        table.add(
+            [
+                {
+                    "entry_id": "duplicate",
+                    "lossless_restatement": "valid duplicate review evidence",
+                    "keywords": ["review", "evidence"],
+                    "timestamp": "",
+                    "location": "",
+                    "persons": [],
+                    "entities": [],
+                    "topic": "review-transport",
+                    "vector": [0.0, 1.0],
+                    "created_at": "2026-11-01T00:00:00Z",
+                    "metadata_json": json.dumps(valid, sort_keys=True),
+                    "retention_purge_after_utc": expiry,
+                }
+            ]
+        )
+        receipt = await store.purge_expired_temporary_review_entries(
+            "mem_global",
+            now_utc=now.isoformat(),
+            limit=2,
+        )
+        remaining = (
+            table.search()
+            .where("entry_id = 'duplicate'")
+            .limit(10)
+            .to_pandas()
+            .to_dict("records")
+        )
+        return receipt, remaining
+
+    receipt, remaining = asyncio.run(exercise())
+    assert receipt["deleted"] == [
+        {"entry_id": "duplicate", "purge_after_utc": expiry}
+    ]
+    assert len(remaining) == 1
+    assert json.loads(remaining[0]["metadata_json"]) == mismatched
+    assert remaining[0]["retention_purge_after_utc"] == ""
 
 
 def test_memory_store_metadata_is_validated_and_included_in_idempotency() -> None:
