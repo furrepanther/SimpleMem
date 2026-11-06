@@ -58,6 +58,24 @@ def test_explicit_local_endpoints_and_fallback_are_preserved():
     assert (all_fallback.base_url, all_fallback.embedding_base_url, all_fallback.rerank_base_url) == (base, base, base)
 
 
+def test_local_clients_do_not_inherit_proxy_environment():
+    base = "http://127.0.0.1:11437/v1"
+    embed = "http://127.0.0.1:11501/v1"
+    rerank = "http://127.0.0.1:11502/v1"
+    client = OpenRouterClient("fixture", base, embed, rerank)
+
+    with patch("httpx.AsyncClient") as http_client:
+        client._get_chat_client()
+        client._get_embed_client()
+        client._get_rerank_client()
+
+    assert http_client.call_count == 3
+    assert all(
+        call.kwargs.get("trust_env") is False
+        for call in http_client.call_args_list
+    )
+
+
 def test_unset_llm_model_falls_back_to_canonical_granite(monkeypatch, tmp_path):
     monkeypatch.delenv("LLM_MODEL", raising=False)
     base = "http://127.0.0.1:11437/v1"

@@ -101,6 +101,11 @@ class OpenRouterClient:
                 base_url=self.base_url,
                 headers=self._build_headers(self.base_url),
                 timeout=120.0,
+                # A loopback URL alone is not a local-only transport proof:
+                # httpx otherwise inherits HTTP(S)_PROXY from the process.
+                # Never let a proxy turn this local inference path into an
+                # external network request.
+                trust_env=False,
             )
         return self._chat_client
 
@@ -113,6 +118,7 @@ class OpenRouterClient:
                 base_url=self.embedding_base_url,
                 headers=self._build_headers(self.embedding_base_url),
                 timeout=120.0,
+                trust_env=False,
             )
         return self._embed_client
 
@@ -125,6 +131,7 @@ class OpenRouterClient:
                 base_url=self.rerank_base_url,
                 headers=self._build_headers(self.rerank_base_url),
                 timeout=120.0,
+                trust_env=False,
             )
         return self._rerank_client
 
