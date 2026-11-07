@@ -42,4 +42,4 @@ def test_explicit_shutdown_has_a_bounded_maintenance_drain(monkeypatch) -> None:
             },
         )
     ]
-    assert runner.MAINTENANCE_GRACEFUL_SHUTDOWN_S < 60
+    assert runner.MAINTENANCE_GRACEFUL_SHUTDOWN_S == 15

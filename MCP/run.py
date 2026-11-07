@@ -16,9 +16,10 @@ import argparse
 # or a runtime deadline: it gives long-lived MCP streams time to drain during
 # a deliberate maintenance quiesce, then lets Uvicorn cancel a stream that
 # would otherwise hold the process forever after it has stopped accepting new
-# work.  The Phase-0 quiescer waits longer than this bound and never escalates
-# to SIGKILL.
-MAINTENANCE_GRACEFUL_SHUTDOWN_S = 45
+# work.  The Phase-0 quiescer observes for 60 seconds, reserving 45 seconds
+# for application cleanup after the stream-draining window.  It never
+# escalates to SIGKILL.
+MAINTENANCE_GRACEFUL_SHUTDOWN_S = 15
 
 
 def main():
