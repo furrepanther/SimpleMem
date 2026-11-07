@@ -363,15 +363,9 @@ async def lifespan(app: FastAPI):
         _default_executor.shutdown(wait=False, cancel_futures=True)
         _default_executor = None
 
-    for task in MCPHandler._worker_tasks:
-        task.cancel()
-    for task in MCPHandler._worker_tasks:
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
-    MCPHandler._worker_tasks.clear()
-
+    # Cancel and observe the whole worker group together.  Waiting five
+    # seconds per task made a configured twelve-worker pool consume a full
+    # minute after the already-bounded MCP stream drain.
     await MCPHandler.stop_background_workers()
 
     print("SimpleMem MCP Server stopped")

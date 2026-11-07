@@ -58,6 +58,10 @@ class JsonRpcResponse:
 MCP_VERSION = "2025-03-26"
 SERVER_NAME = "simplemem"
 SERVER_VERSION = "1.0.0"
+# A deliberate maintenance shutdown must not multiply its cleanup latency by
+# the configured worker count.  The owner cancels the entire worker group, then
+# observes that group for this bounded interval; it never replaces a process.
+DURABLE_WORKER_SHUTDOWN_WAIT_S = 5.0
 
 
 class MemoryBackendUnavailable(RuntimeError):
@@ -271,10 +275,29 @@ class MCPHandler:
                 cls._retention_task.cancel()
                 await asyncio.gather(cls._retention_task, return_exceptions=True)
                 cls._retention_task = None
-            for task in cls._worker_tasks:
+            worker_tasks = tuple(cls._worker_tasks)
+            for task in worker_tasks:
                 task.cancel()
-            if cls._worker_tasks:
-                await asyncio.gather(*cls._worker_tasks, return_exceptions=True)
+            if worker_tasks:
+                done, pending = await asyncio.wait(
+                    worker_tasks,
+                    timeout=DURABLE_WORKER_SHUTDOWN_WAIT_S,
+                )
+                for task in done:
+                    if task.cancelled():
+                        continue
+                    try:
+                        task.result()
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning(
+                            "durable_worker_shutdown_error: %s", exc, exc_info=True
+                        )
+                if pending:
+                    logging.getLogger(__name__).warning(
+                        "durable_worker_shutdown_incomplete pending=%s wait_s=%s",
+                        len(pending),
+                        DURABLE_WORKER_SHUTDOWN_WAIT_S,
+                    )
             cls._worker_tasks = []
 
     @classmethod
