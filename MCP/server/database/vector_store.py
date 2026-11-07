@@ -873,8 +873,15 @@ class MultiTenantVectorStore:
         try:
             if await asyncio.to_thread(table.count_rows) == 0:
                 return {"found": False, "updated": False, "entry_id": entry_id}
-            df = await asyncio.to_thread(table.to_pandas)
-            matches = df[df["entry_id"] == entry_id]
+            # Updating one record must not materialize the whole tenant table.
+            # On a large table Lance spills that scan through TMPDIR; besides
+            # avoidable latency, that can exhaust a WSL tmpfs.  Keep the
+            # identity predicate in Lance and retrieve only the record whose
+            # existing fields are needed to construct the partial update.
+            where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
+            matches = await asyncio.to_thread(
+                lambda: table.search().where(where).limit(1).to_pandas()
+            )
             if matches.empty:
                 return {"found": False, "updated": False, "entry_id": entry_id}
 
@@ -886,7 +893,6 @@ class MultiTenantVectorStore:
                 updates=updates,
                 embedding=embedding,
             )
-            where = f"entry_id = '{self._escape_filter_value(entry_id)}'"
 
             update_values = {k: record[k] for k in allowed if k in updates}
             if embedding is not None:

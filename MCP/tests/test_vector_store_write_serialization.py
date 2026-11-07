@@ -237,3 +237,80 @@ def test_get_entry_pushes_exact_id_filter_to_lance() -> None:
     asyncio.run(exercise())
     assert table.query.where_clause == "entry_id = 'exact''id'"
     assert table.query.limit_value == 1
+
+
+def test_update_entry_pushes_exact_id_filter_to_lance() -> None:
+    class ExactIdQuery:
+        def __init__(self) -> None:
+            self.where_clause: str | None = None
+            self.limit_value: int | None = None
+
+        def where(self, clause: str):
+            self.where_clause = clause
+            return self
+
+        def limit(self, value: int):
+            self.limit_value = value
+            return self
+
+        def to_pandas(self):
+            return pd.DataFrame(
+                [
+                    {
+                        "entry_id": "exact'id",
+                        "lossless_restatement": "exact record",
+                        "keywords": ["exact"],
+                        "timestamp": "",
+                        "location": "",
+                        "persons": [],
+                        "entities": [],
+                        "topic": "before",
+                        "vector": [1.0, 0.0],
+                        "created_at": "2026-11-07T00:00:00Z",
+                        "metadata_json": "",
+                        "retention_purge_after_utc": "",
+                    }
+                ]
+            )
+
+    class ExactIdTable:
+        def __init__(self) -> None:
+            self.queries: list[ExactIdQuery] = []
+            self.updated: list[tuple[str, dict]] = []
+
+        def count_rows(self) -> int:
+            return 100_000
+
+        def search(self):
+            query = ExactIdQuery()
+            self.queries.append(query)
+            return query
+
+        def update(self, *, where: str, values: dict) -> None:
+            self.updated.append((where, values))
+
+        def to_pandas(self):
+            raise AssertionError(
+                "update_entry must not materialize the whole Lance table"
+            )
+
+    table = ExactIdTable()
+    store = _store_for(table)
+
+    async def exercise() -> None:
+        result = await store.update_entry(
+            "mem_global", "exact'id", {"topic": "after"}
+        )
+        assert result == {
+            "found": True,
+            "updated": True,
+            "entry_id": "exact'id",
+            "method": "update",
+        }
+
+    asyncio.run(exercise())
+    assert all(
+        query.where_clause == "entry_id = 'exact''id'" for query in table.queries
+    )
+    assert all(query.limit_value == 1 for query in table.queries)
+    assert table.updated == [("entry_id = 'exact''id'", {"topic": "after"})]
