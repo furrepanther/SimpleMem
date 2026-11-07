@@ -12,6 +12,15 @@ Starts the HTTP server which provides:
 import argparse
 
 
+# This applies only after an explicit shutdown signal.  It is not a watchdog
+# or a runtime deadline: it gives long-lived MCP streams time to drain during
+# a deliberate maintenance quiesce, then lets Uvicorn cancel a stream that
+# would otherwise hold the process forever after it has stopped accepting new
+# work.  The Phase-0 quiescer waits longer than this bound and never escalates
+# to SIGKILL.
+MAINTENANCE_GRACEFUL_SHUTDOWN_S = 45
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SimpleMem MCP Server - Multi-tenant Memory Service for LLM Agents"
@@ -56,6 +65,7 @@ def main():
         host=args.host,
         port=args.port,
         reload=args.reload,
+        timeout_graceful_shutdown=MAINTENANCE_GRACEFUL_SHUTDOWN_S,
     )
 
 
